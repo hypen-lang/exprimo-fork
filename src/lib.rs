@@ -279,18 +279,12 @@ impl Evaluator {
         match (left.clone(), right.clone()) {
             (Value::Number(l), Value::Number(r)) => {
                 let sum = l.as_f64().unwrap() + r.as_f64().unwrap();
-                Ok(Value::Number(serde_json::Number::from_f64(sum).unwrap()))
+                Ok(self.f64_to_value(sum))
             }
             (Value::String(l), Value::String(r)) => Ok(Value::String(l + &r)),
             (Value::String(l), r) => Ok(Value::String(l + &self.value_to_string(&r))),
             (l, Value::String(r)) => Ok(Value::String(self.value_to_string(&l) + &r)),
             _ => {
-                // Type coercion similar to JavaScript
-                // This branch might need to use to_number if we want it to behave like JS '+' with mixed types that coerce to number first.
-                // However, current implementation coerces to string.
-                // If numeric conversion is desired for non-string/non-number types,
-                // to_number should be used, and it returns EvaluationError.
-                // For now, sticking to string concatenation for non-numeric types.
                 let l_str = self.value_to_string(&left);
                 let r_str = self.value_to_string(&right);
                 Ok(Value::String(l_str + &r_str))
@@ -302,45 +296,28 @@ impl Evaluator {
         let l_num = self.to_number(&left)?;
         let r_num = self.to_number(&right)?;
         let result = l_num - r_num;
-        Ok(Value::Number(
-            serde_json::Number::from_f64(result)
-                .unwrap_or_else(|| serde_json::Number::from_f64(0.0).unwrap()),
-        ))
+        Ok(self.f64_to_value(result))
     }
 
     fn multiply_values(&self, left: Value, right: Value) -> Result<Value, EvaluationError> {
         let l_num = self.to_number(&left)?;
         let r_num = self.to_number(&right)?;
         let result = l_num * r_num;
-        Ok(Value::Number(
-            serde_json::Number::from_f64(result)
-                .unwrap_or_else(|| serde_json::Number::from_f64(0.0).unwrap()),
-        ))
+        Ok(self.f64_to_value(result))
     }
 
     fn divide_values(&self, left: Value, right: Value) -> Result<Value, EvaluationError> {
         let l_num = self.to_number(&left)?;
         let r_num = self.to_number(&right)?;
-        // JavaScript behavior: division by zero returns Infinity, -Infinity, or NaN
         let result = l_num / r_num;
-        Ok(Value::Number(
-            serde_json::Number::from_f64(result).unwrap_or_else(|| {
-                // Handle NaN, Infinity, -Infinity by converting to null
-                // Note: serde_json doesn't support NaN/Infinity in Number type
-                // We'll use a special representation
-                serde_json::Number::from_f64(0.0).unwrap()
-            }),
-        ))
+        Ok(self.f64_to_value(result))
     }
 
     fn modulo_values(&self, left: Value, right: Value) -> Result<Value, EvaluationError> {
         let l_num = self.to_number(&left)?;
         let r_num = self.to_number(&right)?;
         let result = l_num % r_num;
-        Ok(Value::Number(
-            serde_json::Number::from_f64(result)
-                .unwrap_or_else(|| serde_json::Number::from_f64(0.0).unwrap()),
-        ))
+        Ok(self.f64_to_value(result))
     }
 
     fn compare_values<F>(
@@ -375,11 +352,11 @@ impl Evaluator {
             Some((_, UnaryOp::LogicalNot)) => Value::Bool(!self.to_boolean(&expr_value)?),
             Some((_, UnaryOp::Minus)) => {
                 let num = self.to_number(&expr_value)?;
-                Value::Number(serde_json::Number::from_f64(-num).unwrap())
+                self.f64_to_value(-num)
             }
             Some((_, UnaryOp::Plus)) => {
                 let num = self.to_number(&expr_value)?;
-                Value::Number(serde_json::Number::from_f64(num).unwrap())
+                self.f64_to_value(num)
             }
             _ => {
                 return Err(EvaluationError::Node(NodeError {
@@ -684,7 +661,6 @@ impl Evaluator {
 
         // Handle string literals with escape sequences
         if literal_str.starts_with('"') || literal_str.starts_with('\'') {
-            let quote_char = literal_str.chars().next().unwrap();
             // Remove only the first and last character (the quotes)
             let unquoted = if literal_str.len() >= 2 {
                 &literal_str[1..literal_str.len() - 1]
@@ -769,8 +745,28 @@ impl Evaluator {
         }
     }
 
+    fn f64_to_value(&self, num: f64) -> Value {
+        if let Some(n) = serde_json::Number::from_f64(num) {
+            Value::Number(n)
+        } else if num.is_nan() {
+            Value::Null
+        } else if num.is_infinite() {
+            // Represent Infinity as max f64 as checked in evaluate_by_name
+            Value::Number(
+                serde_json::Number::from_f64(if num.is_sign_positive() {
+                    f64::MAX
+                } else {
+                    f64::MIN
+                })
+                .unwrap(),
+            )
+        } else {
+            Value::Null
+        }
+    }
+
     fn process_escape_sequences(&self, s: &str) -> String {
-        let mut result = String::new();
+        let mut result = String::with_capacity(s.len());
         let mut chars = s.chars();
 
         while let Some(ch) = chars.next() {
@@ -784,8 +780,6 @@ impl Evaluator {
                         '\'' => result.push('\''),
                         '"' => result.push('"'),
                         '0' => result.push('\0'),
-                        // For simplicity, we don't handle \uXXXX or \xXX here
-                        // Just pass through the escaped character
                         _ => {
                             result.push('\\');
                             result.push(next_ch);
@@ -798,7 +792,6 @@ impl Evaluator {
                 result.push(ch);
             }
         }
-
         result
     }
 
