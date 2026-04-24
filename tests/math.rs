@@ -365,3 +365,216 @@ fn to_fixed_in_concatenation() {
         s("$9.50")
     );
 }
+
+// =============================================================================
+// Math with coerced non-number arguments
+// =============================================================================
+
+#[test]
+fn math_floor_coerces_null_to_zero() {
+    assert_eq!(ev().evaluate("Math.floor(null)").unwrap(), num(0.0));
+}
+
+#[test]
+fn math_floor_coerces_booleans() {
+    assert_eq!(ev().evaluate("Math.floor(true)").unwrap(), num(1.0));
+    assert_eq!(ev().evaluate("Math.floor(false)").unwrap(), num(0.0));
+}
+
+#[test]
+fn math_ceil_coerces_booleans() {
+    assert_eq!(ev().evaluate("Math.ceil(true)").unwrap(), num(1.0));
+    assert_eq!(ev().evaluate("Math.ceil(false)").unwrap(), num(0.0));
+}
+
+#[test]
+fn math_round_coerces_null_and_booleans() {
+    assert_eq!(ev().evaluate("Math.round(null)").unwrap(), num(0.0));
+    assert_eq!(ev().evaluate("Math.round(true)").unwrap(), num(1.0));
+    assert_eq!(ev().evaluate("Math.round(false)").unwrap(), num(0.0));
+}
+
+#[test]
+fn math_abs_coerces_null_and_booleans() {
+    assert_eq!(ev().evaluate("Math.abs(null)").unwrap(), num(0.0));
+    assert_eq!(ev().evaluate("Math.abs(true)").unwrap(), num(1.0));
+    assert_eq!(ev().evaluate("Math.abs(false)").unwrap(), num(0.0));
+}
+
+#[test]
+fn math_floor_of_non_numeric_string_yields_null() {
+    // 'abc' → NaN → floor(NaN) returns Null via f64_to_value.
+    assert_eq!(ev().evaluate("Math.floor('abc')").unwrap(), Value::Null);
+    assert_eq!(ev().evaluate("Math.abs('xyz')").unwrap(), Value::Null);
+}
+
+#[test]
+fn math_min_mixed_coercion() {
+    // null→0, true→1, false→0, '3'→3. Minimum of {0, 1, 0, 3} is 0.
+    assert_eq!(
+        ev().evaluate("Math.min(null, true, false, '3')").unwrap(),
+        num(0.0)
+    );
+}
+
+#[test]
+fn math_max_mixed_coercion() {
+    // {0, 1, 0, 2} → max 2
+    assert_eq!(
+        ev().evaluate("Math.max(null, true, false, 2)").unwrap(),
+        num(2.0)
+    );
+}
+
+#[test]
+fn math_min_max_with_boolean_only() {
+    assert_eq!(ev().evaluate("Math.min(true, false)").unwrap(), num(0.0));
+    assert_eq!(ev().evaluate("Math.max(true, false)").unwrap(), num(1.0));
+}
+
+#[test]
+fn math_min_with_unparseable_string_propagates_nan() {
+    // NaN from 'abc' → min returns Null (f64_to_value converts NaN to Null).
+    assert_eq!(ev().evaluate("Math.min('abc', 1)").unwrap(), Value::Null);
+    assert_eq!(ev().evaluate("Math.max('abc', 1)").unwrap(), Value::Null);
+}
+
+// =============================================================================
+// Math with Infinity arguments
+// =============================================================================
+//
+// exprimo represents Infinity as f64::MAX because serde_json::Number cannot
+// store actual f64::INFINITY. Thus Math.*(Infinity) returns the same sentinel.
+
+fn is_positive_infinity_sentinel(v: Value) -> bool {
+    match v {
+        Value::Number(n) => n.as_f64().unwrap() > 1.0e300,
+        _ => false,
+    }
+}
+
+fn is_negative_infinity_sentinel(v: Value) -> bool {
+    match v {
+        Value::Number(n) => n.as_f64().unwrap() < -1.0e300,
+        _ => false,
+    }
+}
+
+#[test]
+fn math_floor_of_infinity_returns_infinity_sentinel() {
+    assert!(is_positive_infinity_sentinel(
+        ev().evaluate("Math.floor(Infinity)").unwrap()
+    ));
+}
+
+#[test]
+fn math_ceil_of_infinity_returns_infinity_sentinel() {
+    assert!(is_positive_infinity_sentinel(
+        ev().evaluate("Math.ceil(Infinity)").unwrap()
+    ));
+}
+
+#[test]
+fn math_round_of_infinity_returns_infinity_sentinel() {
+    assert!(is_positive_infinity_sentinel(
+        ev().evaluate("Math.round(Infinity)").unwrap()
+    ));
+}
+
+#[test]
+fn math_abs_of_negative_infinity_returns_positive_infinity() {
+    assert!(is_positive_infinity_sentinel(
+        ev().evaluate("Math.abs(-Infinity)").unwrap()
+    ));
+}
+
+#[test]
+fn math_min_with_negative_infinity() {
+    assert!(is_negative_infinity_sentinel(
+        ev().evaluate("Math.min(-Infinity, 1)").unwrap()
+    ));
+}
+
+#[test]
+fn math_max_with_positive_infinity() {
+    assert!(is_positive_infinity_sentinel(
+        ev().evaluate("Math.max(Infinity, 1)").unwrap()
+    ));
+}
+
+#[test]
+fn math_with_very_large_numbers() {
+    // Very large finite number floors/ceils to itself.
+    let v = ev().evaluate("Math.floor(1e300)").unwrap();
+    match v {
+        Value::Number(n) => assert!(n.as_f64().unwrap() > 1e299),
+        other => panic!("expected Number, got {:?}", other),
+    }
+}
+
+// =============================================================================
+// Number.toFixed with coerced digit arguments
+// =============================================================================
+
+#[test]
+fn to_fixed_digit_arg_is_string() {
+    // JS coerces the digit argument using ToIntegerOrInfinity.
+    assert_eq!(ev().evaluate("(1).toFixed('2')").unwrap(), s("1.00"));
+    assert_eq!(ev().evaluate("(3.14).toFixed('1')").unwrap(), s("3.1"));
+}
+
+#[test]
+fn to_fixed_digit_arg_is_boolean() {
+    // true → 1 digit, false → 0 digits
+    assert_eq!(ev().evaluate("(1).toFixed(true)").unwrap(), s("1.0"));
+    assert_eq!(ev().evaluate("(1).toFixed(false)").unwrap(), s("1"));
+}
+
+#[test]
+fn to_fixed_digit_arg_is_null() {
+    // null → 0 digits
+    assert_eq!(ev().evaluate("(1.7).toFixed(null)").unwrap(), s("2"));
+    assert_eq!(ev().evaluate("(3.14).toFixed(null)").unwrap(), s("3"));
+}
+
+#[test]
+fn to_fixed_digit_arg_unparseable_string_becomes_zero() {
+    // 'abc' → NaN → arg_to_int returns 0 (NaN short-circuit).
+    assert_eq!(ev().evaluate("(3.14).toFixed('abc')").unwrap(), s("3"));
+}
+
+#[test]
+fn to_fixed_on_infinity_produces_long_string() {
+    // exprimo's Infinity is f64::MAX; toFixed(2) produces the literal expansion.
+    let v = ev().evaluate("Infinity.toFixed(2)").unwrap();
+    match v {
+        Value::String(out) => {
+            assert!(out.ends_with(".00"));
+            // f64::MAX is ~309 digits before the decimal.
+            assert!(out.len() > 300, "expected a very long number, got len={}", out.len());
+        }
+        other => panic!("expected String, got {:?}", other),
+    }
+}
+
+// =============================================================================
+// Math namespace edge cases
+// =============================================================================
+
+#[test]
+fn math_nested_with_mixed_types() {
+    // Math.floor(Math.abs(true) + Math.abs(null)) === 1
+    assert_eq!(
+        ev().evaluate("Math.floor(Math.abs(true) + Math.abs(null))").unwrap(),
+        num(1.0)
+    );
+}
+
+#[test]
+fn math_deep_chained_in_expression() {
+    // Math.min(Math.abs(-5), Math.ceil(2.3), Math.floor(10.9), 7) === 3
+    assert_eq!(
+        ev().evaluate("Math.min(Math.abs(-5), Math.ceil(2.3), Math.floor(10.9), 7)").unwrap(),
+        num(3.0)
+    );
+}

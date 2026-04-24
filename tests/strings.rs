@@ -412,3 +412,200 @@ fn string_in_ternary_via_length() {
         s("nonempty")
     );
 }
+
+// =============================================================================
+// Deep method chaining (3+ levels)
+// =============================================================================
+
+#[test]
+fn three_level_chain_trim_upper_slice() {
+    assert_eq!(
+        ev().evaluate("'  hello world  '.trim().toUpperCase().slice(0, 5)").unwrap(),
+        s("HELLO")
+    );
+}
+
+#[test]
+fn three_level_chain_slice_upper_length() {
+    assert_eq!(
+        ev().evaluate("'hello world'.slice(0, 5).toUpperCase().length").unwrap(),
+        num(5.0)
+    );
+}
+
+#[test]
+fn four_level_chain_on_array_through_join() {
+    // array → slice → join → toUpperCase → slice
+    assert_eq!(
+        ev().evaluate("['ab', 'cd', 'ef'].slice(0, 2).join('-').toUpperCase().slice(0, 2)").unwrap(),
+        s("AB")
+    );
+}
+
+#[test]
+fn chain_mixing_string_and_number_methods() {
+    // trim() → length → toFixed(1): "  hi  ".trim() === "hi" (length 2) → "2.0"
+    assert_eq!(
+        ev().evaluate("'  hi  '.trim().length.toFixed(1)").unwrap(),
+        s("2.0")
+    );
+}
+
+#[test]
+fn chain_with_every_string_method() {
+    // Exercise every string method in a single pipeline.
+    // '  Hello World  '.trim() === 'Hello World'
+    // .toLowerCase() === 'hello world'
+    // .slice(6) === 'world'
+    // .toUpperCase() === 'WORLD'
+    // .includes('OR') === true
+    assert_eq!(
+        ev()
+            .evaluate("'  Hello World  '.trim().toLowerCase().slice(6).toUpperCase().includes('OR')")
+            .unwrap(),
+        Value::Bool(true)
+    );
+}
+
+#[test]
+fn chain_indexOf_on_trimmed_upper_lower() {
+    assert_eq!(
+        ev()
+            .evaluate("'  Hello  '.trim().toUpperCase().indexOf('LL')")
+            .unwrap(),
+        num(2.0)
+    );
+}
+
+#[test]
+fn chain_concat_of_two_method_chains() {
+    assert_eq!(
+        ev()
+            .evaluate("'alpha'.toUpperCase().slice(0, 3) + 'beta'.toUpperCase().slice(0, 3)")
+            .unwrap(),
+        s("ALPBET")
+    );
+}
+
+// =============================================================================
+// String.indexOf — multiple occurrences, edge cases
+// =============================================================================
+
+#[test]
+fn index_of_first_occurrence_among_many() {
+    assert_eq!(ev().evaluate("'abab'.indexOf('a')").unwrap(), num(0.0));
+    assert_eq!(ev().evaluate("'abab'.indexOf('b')").unwrap(), num(1.0));
+    assert_eq!(ev().evaluate("'hello'.indexOf('l')").unwrap(), num(2.0));
+    assert_eq!(ev().evaluate("'xxxxx'.indexOf('x')").unwrap(), num(0.0));
+}
+
+#[test]
+fn index_of_finds_multi_char_needle() {
+    assert_eq!(
+        ev().evaluate("'foobar'.indexOf('bar')").unwrap(),
+        num(3.0)
+    );
+    assert_eq!(
+        ev().evaluate("'foobarbar'.indexOf('bar')").unwrap(),
+        num(3.0)
+    );
+}
+
+#[test]
+fn index_of_needle_longer_than_haystack() {
+    assert_eq!(
+        ev().evaluate("'hi'.indexOf('hello')").unwrap(),
+        num(-1.0)
+    );
+}
+
+#[test]
+fn index_of_needle_equals_haystack() {
+    assert_eq!(
+        ev().evaluate("'abc'.indexOf('abc')").unwrap(),
+        num(0.0)
+    );
+}
+
+// =============================================================================
+// Unicode edge cases
+// =============================================================================
+
+#[test]
+fn to_upper_case_expands_sharp_s_to_ss() {
+    // 'ß'.toUpperCase() === "SS" in both Rust and JS (ECMAScript spec).
+    // Length grows from 1 to 2.
+    assert_eq!(ev().evaluate("'ß'.toUpperCase()").unwrap(), s("SS"));
+    assert_eq!(ev().evaluate("'ß'.toUpperCase().length").unwrap(), num(2.0));
+}
+
+#[test]
+fn to_lower_case_of_turkish_capital_I_expands() {
+    // 'İ' (U+0130) lowercased → 'i' + U+0307 (combining dot above) in both
+    // Rust and JS, producing a 2-char result.
+    let result = ev().evaluate("'İ'.toLowerCase().length").unwrap();
+    assert_eq!(result, num(2.0));
+}
+
+#[test]
+fn trim_strips_non_ascii_whitespace() {
+    // NBSP (U+00A0) — Rust trim strips it, matching modern JS.
+    let result = ev().evaluate("'\u{00A0}hi\u{00A0}'.trim()").unwrap();
+    assert_eq!(result, s("hi"));
+}
+
+#[test]
+fn length_with_combining_characters() {
+    // "a\u{0301}" → 'a' + combining acute. exprimo counts code points, so 2.
+    let result = ev().evaluate("'a\u{0301}'.length").unwrap();
+    assert_eq!(result, num(2.0));
+}
+
+#[test]
+fn slice_preserves_multibyte_boundaries() {
+    // 🎉 is 1 code point but 4 UTF-8 bytes. Char-based slicing keeps it intact.
+    assert_eq!(ev().evaluate("'🎉🎉🎉'.slice(0, 2)").unwrap(), s("🎉🎉"));
+    assert_eq!(ev().evaluate("'🎉🎉🎉'.length").unwrap(), num(3.0));
+}
+
+#[test]
+fn indexOf_with_multibyte_needle_and_haystack() {
+    // Emoji needle found at char-index 2, not byte-index 8.
+    assert_eq!(ev().evaluate("'a🎉b🎉c'.indexOf('🎉')").unwrap(), num(1.0));
+    // Second occurrence → still reports first.
+    assert_eq!(ev().evaluate("'🎉🎉🎉'.indexOf('🎉')").unwrap(), num(0.0));
+}
+
+#[test]
+fn case_conversion_preserves_ascii_mixed_with_unicode() {
+    assert_eq!(
+        ev().evaluate("'Héllo Wörld'.toUpperCase()").unwrap(),
+        s("HÉLLO WÖRLD")
+    );
+    assert_eq!(
+        ev().evaluate("'HÉLLO WÖRLD'.toLowerCase()").unwrap(),
+        s("héllo wörld")
+    );
+}
+
+#[test]
+fn string_index_into_multibyte_result_of_upper() {
+    // 'ß'.toUpperCase() === "SS"; [1] === "S".
+    assert_eq!(ev().evaluate("'ß'.toUpperCase()[1]").unwrap(), s("S"));
+}
+
+#[test]
+fn includes_multibyte_substring() {
+    assert_eq!(
+        ev().evaluate("'café'.includes('fé')").unwrap(),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        ev().evaluate("'café'.startsWith('ca')").unwrap(),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        ev().evaluate("'café'.endsWith('fé')").unwrap(),
+        Value::Bool(true)
+    );
+}

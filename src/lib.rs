@@ -837,8 +837,23 @@ impl Evaluator {
             Value::Number(n) => n.to_string(),
             Value::Bool(b) => b.to_string(),
             Value::Null => "null".to_string(),
-            Value::Array(_) => "[Array]".to_string(),
-            Value::Object(_) => "[Object]".to_string(),
+            // JS: Array.prototype.toString() === join(','), which renders null
+            // and nested arrays recursively; objects render as "[object Object]".
+            Value::Array(arr) => arr
+                .iter()
+                .map(|item| self.value_to_join_element(item))
+                .collect::<Vec<_>>()
+                .join(","),
+            Value::Object(_) => "[object Object]".to_string(),
+        }
+    }
+
+    /// Element-level stringification used inside arrays (for `.join` and
+    /// Array-to-string coercion). Matches JS: null/undefined → empty string.
+    fn value_to_join_element(&self, value: &Value) -> String {
+        match value {
+            Value::Null => String::new(),
+            _ => self.value_to_string(value),
         }
     }
 
@@ -1129,10 +1144,7 @@ impl Evaluator {
                 if let Value::Array(arr) = object {
                     let parts: Vec<String> = arr
                         .iter()
-                        .map(|v| match v {
-                            Value::Null => String::new(),
-                            _ => self.value_to_string(v),
-                        })
+                        .map(|v| self.value_to_join_element(v))
                         .collect();
                     Ok(Value::String(parts.join(&sep)))
                 } else {

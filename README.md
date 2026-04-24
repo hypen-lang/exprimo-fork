@@ -561,8 +561,9 @@ See [CHANGELOG.md](CHANGELOG.md) for version history.
 - ✅ `Math` namespace: `floor`, `ceil`, `round`, `abs`, `min`, `max`
 - ✅ `Object` namespace: `keys`, `values`, `entries`
 - ✅ Complex array/object literals: `[1, 2, 3]`, `({a: 1, b: 2})` (with nested and expression values)
-- ✅ Bracket indexing: `arr[0]`, `obj[key]`, `str[0]` with dynamic keys
+- ✅ Bracket indexing: `arr[0]`, `obj[key]`, `str[0]` with dynamic keys and type coercion (`arr[true]`, `arr['0']`, `obj[null]`)
 - ✅ Additional array methods: `.indexOf()`, `.join()`, `.slice()`
+- ✅ JS-compliant Array/Object coercion: `[1,[2,3]].join('-')` produces `"1-2,3"` (recursive), objects stringify to `"[object Object]"`
 - ✅ Division by zero returns `Infinity`/`NaN` instead of errors
 - ✅ Invalid type conversions return `NaN` instead of errors
 - ✅ Proper NaN comparison semantics (`NaN != NaN`)

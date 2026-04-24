@@ -586,3 +586,433 @@ fn dynamic_access_pattern_item_at_index() {
         s("bob")
     );
 }
+
+// =============================================================================
+// Bracket indexing — coercion of unusual index types
+// =============================================================================
+
+fn arr3() -> Value {
+    Value::Array(vec![s("a"), s("b"), s("c")])
+}
+
+#[test]
+fn array_index_with_boolean_true_becomes_one() {
+    let ev = ev_with(&[("a", arr3())]);
+    assert_eq!(ev.evaluate("a[true]").unwrap(), s("b"));
+}
+
+#[test]
+fn array_index_with_boolean_false_becomes_zero() {
+    let ev = ev_with(&[("a", arr3())]);
+    assert_eq!(ev.evaluate("a[false]").unwrap(), s("a"));
+}
+
+#[test]
+fn array_index_with_null_becomes_zero() {
+    let ev = ev_with(&[("a", arr3())]);
+    assert_eq!(ev.evaluate("a[null]").unwrap(), s("a"));
+}
+
+#[test]
+fn array_index_with_string_numeric() {
+    let ev = ev_with(&[("a", arr3())]);
+    assert_eq!(ev.evaluate("a['0']").unwrap(), s("a"));
+    assert_eq!(ev.evaluate("a['1']").unwrap(), s("b"));
+    assert_eq!(ev.evaluate("a['2']").unwrap(), s("c"));
+}
+
+#[test]
+fn array_index_with_infinity_out_of_range() {
+    // Infinity sentinel is f64::MAX which saturates as usize::MAX on cast.
+    let ev = ev_with(&[("a", arr3())]);
+    assert_eq!(ev.evaluate("a[Infinity]").unwrap(), Value::Null);
+}
+
+#[test]
+fn array_index_with_negative_infinity() {
+    let ev = ev_with(&[("a", arr3())]);
+    assert_eq!(ev.evaluate("a[-Infinity]").unwrap(), Value::Null);
+}
+
+#[test]
+fn array_index_with_huge_number_does_not_panic() {
+    // 1e20 > usize::MAX on 64-bit; the `as usize` cast saturates.
+    let ev = ev_with(&[("a", arr3())]);
+    assert_eq!(ev.evaluate("a[1e20]").unwrap(), Value::Null);
+    assert_eq!(ev.evaluate("a[1e300]").unwrap(), Value::Null);
+}
+
+#[test]
+fn array_index_with_negative_zero_behaves_as_zero() {
+    let ev = ev_with(&[("a", arr3())]);
+    assert_eq!(ev.evaluate("a[-0]").unwrap(), s("a"));
+}
+
+#[test]
+fn array_index_with_expression_result() {
+    let ev = ev_with(&[("a", arr3())]);
+    assert_eq!(ev.evaluate("a[1 + 0]").unwrap(), s("b"));
+    assert_eq!(ev.evaluate("a[2 * 1]").unwrap(), s("c"));
+    // 1 - 2 = -1 → null
+    assert_eq!(ev.evaluate("a[1 - 2]").unwrap(), Value::Null);
+}
+
+#[test]
+fn object_index_with_boolean_matches_stringified_key() {
+    // The literal keys "true" and "false" (as stored in the map) are found
+    // when indexing with Boolean, which coerces to "true"/"false".
+    let mut m = serde_json::Map::new();
+    m.insert("true".into(), s("T"));
+    m.insert("false".into(), s("F"));
+    let ev = ev_with(&[("o", Value::Object(m))]);
+    assert_eq!(ev.evaluate("o[true]").unwrap(), s("T"));
+    assert_eq!(ev.evaluate("o[false]").unwrap(), s("F"));
+}
+
+#[test]
+fn object_index_with_null_matches_null_key() {
+    let mut m = serde_json::Map::new();
+    m.insert("null".into(), s("was-null"));
+    let ev = ev_with(&[("o", Value::Object(m))]);
+    assert_eq!(ev.evaluate("o[null]").unwrap(), s("was-null"));
+}
+
+#[test]
+fn object_index_with_numeric_literal_uses_f64_stringification_quirk() {
+    // Numeric literals stringify as "1.0" not "1" (exprimo f64 quirk),
+    // so `o[1]` does NOT match the JSON-standard key "1".
+    let mut m = serde_json::Map::new();
+    m.insert("1".into(), s("one"));
+    m.insert("1.0".into(), s("one-point-zero"));
+    let ev = ev_with(&[("o", Value::Object(m))]);
+    assert_eq!(ev.evaluate("o[1]").unwrap(), s("one-point-zero"));
+    // The canonical "1" key is only reachable via the string form.
+    assert_eq!(ev.evaluate("o['1']").unwrap(), s("one"));
+}
+
+#[test]
+fn object_index_with_numeric_expression_quirk() {
+    // 1 + 1 = 2 (f64), stringifies as "2.0"
+    let mut m = serde_json::Map::new();
+    m.insert("2".into(), s("two"));
+    m.insert("2.0".into(), s("two-float"));
+    let ev = ev_with(&[("o", Value::Object(m))]);
+    assert_eq!(ev.evaluate("o[1 + 1]").unwrap(), s("two-float"));
+}
+
+#[test]
+fn string_index_with_boolean() {
+    let ev = ev_with(&[("s", s("abc"))]);
+    assert_eq!(ev.evaluate("s[true]").unwrap(), s("b"));
+    assert_eq!(ev.evaluate("s[false]").unwrap(), s("a"));
+}
+
+#[test]
+fn string_index_with_fractional_returns_null() {
+    let ev = ev_with(&[("s", s("abc"))]);
+    assert_eq!(ev.evaluate("s[0.5]").unwrap(), Value::Null);
+    assert_eq!(ev.evaluate("s[1.7]").unwrap(), Value::Null);
+}
+
+#[test]
+fn string_index_with_string_numeric() {
+    let ev = ev_with(&[("s", s("abc"))]);
+    assert_eq!(ev.evaluate("s['1']").unwrap(), s("b"));
+}
+
+#[test]
+fn string_index_with_infinity_returns_null() {
+    let ev = ev_with(&[("s", s("abc"))]);
+    assert_eq!(ev.evaluate("s[Infinity]").unwrap(), Value::Null);
+}
+
+// =============================================================================
+// join — recursive stringification of nested arrays and objects
+// =============================================================================
+//
+// JS: Array.prototype.toString is equivalent to .join(','), and join
+// stringifies each element via toString (recursive for arrays, static
+// "[object Object]" for objects). exprimo now matches this, modulo the
+// f64 stringification quirk (integer values render with ".0").
+
+#[test]
+fn join_nested_arrays_recursively() {
+    // JS: [[1,2], [3,4]].join('-') === "1,2-3,4" (exprimo adds .0 for floats)
+    let ev = ev_with(&[(
+        "a",
+        Value::Array(vec![
+            Value::Array(vec![num(1.0), num(2.0)]),
+            Value::Array(vec![num(3.0), num(4.0)]),
+        ]),
+    )]);
+    assert_eq!(ev.evaluate("a.join('-')").unwrap(), s("1.0,2.0-3.0,4.0"));
+}
+
+#[test]
+fn join_nested_arrays_with_integer_valued_numbers() {
+    // Integer-typed numbers (from context, not literals) stringify cleanly.
+    let ev = ev_with(&[(
+        "a",
+        Value::Array(vec![
+            Value::Array(vec![Value::Number(1.into()), Value::Number(2.into())]),
+            Value::Array(vec![Value::Number(3.into()), Value::Number(4.into())]),
+        ]),
+    )]);
+    assert_eq!(ev.evaluate("a.join('-')").unwrap(), s("1,2-3,4"));
+}
+
+#[test]
+fn join_single_nested_array() {
+    let ev = ev_with(&[(
+        "a",
+        Value::Array(vec![Value::Array(vec![
+            Value::Number(1.into()),
+            Value::Number(2.into()),
+            Value::Number(3.into()),
+        ])]),
+    )]);
+    // One outer element (a 3-element array). Default separator never used.
+    assert_eq!(ev.evaluate("a.join(',')").unwrap(), s("1,2,3"));
+}
+
+#[test]
+fn join_array_containing_object() {
+    // Objects stringify as "[object Object]" (JS: same).
+    let mut m = serde_json::Map::new();
+    m.insert("a".into(), Value::Number(1.into()));
+    let ev = ev_with(&[("a", Value::Array(vec![Value::Object(m)]))]);
+    assert_eq!(ev.evaluate("a.join(',')").unwrap(), s("[object Object]"));
+}
+
+#[test]
+fn join_mixed_nesting() {
+    let ev = ev_with(&[(
+        "a",
+        Value::Array(vec![
+            Value::Number(1.into()),
+            Value::Array(vec![Value::Number(2.into()), Value::Number(3.into())]),
+            Value::Number(4.into()),
+        ]),
+    )]);
+    assert_eq!(ev.evaluate("a.join('|')").unwrap(), s("1|2,3|4"));
+}
+
+#[test]
+fn join_of_all_nulls() {
+    let ev = ev_with(&[(
+        "a",
+        Value::Array(vec![Value::Null, Value::Null, Value::Null]),
+    )]);
+    assert_eq!(ev.evaluate("a.join(',')").unwrap(), s(",,"));
+}
+
+#[test]
+fn concatenation_stringifies_arrays_recursively() {
+    // 'x' + [1,2] in JS becomes "x1,2". exprimo matches modulo f64 quirk.
+    let ev = ev_with(&[(
+        "a",
+        Value::Array(vec![Value::Number(1.into()), Value::Number(2.into())]),
+    )]);
+    assert_eq!(ev.evaluate("'x' + a").unwrap(), s("x1,2"));
+    assert_eq!(ev.evaluate("a + 'x'").unwrap(), s("1,2x"));
+}
+
+#[test]
+fn concatenation_stringifies_objects() {
+    let mut m = serde_json::Map::new();
+    m.insert("k".into(), s("v"));
+    let ev = ev_with(&[("o", Value::Object(m))]);
+    assert_eq!(ev.evaluate("o + ''").unwrap(), s("[object Object]"));
+    assert_eq!(ev.evaluate("'pre:' + o").unwrap(), s("pre:[object Object]"));
+}
+
+#[test]
+fn concatenation_stringifies_nested_structures() {
+    // Deep array inside a string concat still recurses.
+    let ev = ev_with(&[(
+        "a",
+        Value::Array(vec![
+            Value::Number(1.into()),
+            Value::Array(vec![Value::Number(2.into()), Value::Number(3.into())]),
+        ]),
+    )]);
+    assert_eq!(ev.evaluate("'[' + a + ']'").unwrap(), s("[1,2,3]"));
+}
+
+// =============================================================================
+// Array.indexOf — reference inequality of compound values
+// =============================================================================
+
+#[test]
+fn array_index_of_nested_array_literal_not_found() {
+    // JS: array literals are new objects each time; strict equality is by ref.
+    assert_eq!(ev().evaluate("[[1, 2]].indexOf([1, 2])").unwrap(), num(-1.0));
+}
+
+#[test]
+fn array_index_of_nested_object_literal_not_found() {
+    assert_eq!(
+        ev().evaluate("[({a: 1})].indexOf({a: 1})").unwrap(),
+        num(-1.0)
+    );
+}
+
+#[test]
+fn array_index_of_returns_first_of_multiple_occurrences() {
+    let ev = ev_with(&[(
+        "a",
+        Value::Array(vec![
+            s("x"),
+            s("y"),
+            s("x"),
+            s("y"),
+            s("x"),
+        ]),
+    )]);
+    assert_eq!(ev.evaluate("a.indexOf('x')").unwrap(), num(0.0));
+    assert_eq!(ev.evaluate("a.indexOf('y')").unwrap(), num(1.0));
+}
+
+// =============================================================================
+// Array.slice — more permutations
+// =============================================================================
+
+#[test]
+fn array_slice_fractional_indices_truncate() {
+    // JS ToIntegerOrInfinity truncates toward zero; exprimo does the same.
+    let ev = ev_with(&[(
+        "a",
+        Value::Array(vec![Value::Number(1.into()), Value::Number(2.into()), Value::Number(3.into())]),
+    )]);
+    assert_eq!(
+        ev.evaluate("a.slice(0.5, 2.5)").unwrap(),
+        Value::Array(vec![Value::Number(1.into()), Value::Number(2.into())])
+    );
+}
+
+#[test]
+fn array_slice_string_coerced_indices() {
+    let ev = ev_with(&[(
+        "a",
+        Value::Array(vec![Value::Number(1.into()), Value::Number(2.into()), Value::Number(3.into())]),
+    )]);
+    assert_eq!(
+        ev.evaluate("a.slice('1', '3')").unwrap(),
+        Value::Array(vec![Value::Number(2.into()), Value::Number(3.into())])
+    );
+}
+
+#[test]
+fn array_slice_negative_zero() {
+    // -0 is treated as 0; slice(-0) returns a full copy.
+    let ev = ev_with(&[(
+        "a",
+        Value::Array(vec![Value::Number(1.into()), Value::Number(2.into()), Value::Number(3.into())]),
+    )]);
+    assert_eq!(
+        ev.evaluate("a.slice(-0)").unwrap(),
+        Value::Array(vec![Value::Number(1.into()), Value::Number(2.into()), Value::Number(3.into())])
+    );
+}
+
+#[test]
+fn array_slice_null_and_boolean_indices() {
+    // null → 0; true → 1; false → 0
+    let ev = ev_with(&[(
+        "a",
+        Value::Array(vec![Value::Number(1.into()), Value::Number(2.into()), Value::Number(3.into()), Value::Number(4.into())]),
+    )]);
+    assert_eq!(
+        ev.evaluate("a.slice(null, 2)").unwrap(),
+        Value::Array(vec![Value::Number(1.into()), Value::Number(2.into())])
+    );
+    assert_eq!(
+        ev.evaluate("a.slice(true, 3)").unwrap(),
+        Value::Array(vec![Value::Number(2.into()), Value::Number(3.into())])
+    );
+    assert_eq!(
+        ev.evaluate("a.slice(false, true)").unwrap(),
+        Value::Array(vec![Value::Number(1.into())])
+    );
+}
+
+// =============================================================================
+// Indexing on function-call results (systematic)
+// =============================================================================
+
+#[test]
+fn index_into_object_keys_array() {
+    let mut m = serde_json::Map::new();
+    m.insert("alpha".into(), Value::Number(1.into()));
+    m.insert("beta".into(), Value::Number(2.into()));
+    m.insert("gamma".into(), Value::Number(3.into()));
+    let ev = ev_with(&[("o", Value::Object(m))]);
+    // BTreeMap: alphabetical, so [0] === "alpha"
+    assert_eq!(ev.evaluate("Object.keys(o)[0]").unwrap(), s("alpha"));
+    assert_eq!(ev.evaluate("Object.keys(o)[2]").unwrap(), s("gamma"));
+}
+
+#[test]
+fn chained_function_call_then_index_then_method() {
+    let mut m = serde_json::Map::new();
+    m.insert("first".into(), s("alice"));
+    m.insert("second".into(), s("bob"));
+    let ev = ev_with(&[("o", Value::Object(m))]);
+    // Object.keys → ["first", "second"]; [0] === "first"; .toUpperCase() === "FIRST"
+    assert_eq!(
+        ev.evaluate("Object.keys(o)[0].toUpperCase()").unwrap(),
+        s("FIRST")
+    );
+}
+
+#[test]
+fn index_into_slice_result() {
+    let ev = ev_with(&[(
+        "a",
+        Value::Array(vec![
+            Value::Number(10.into()),
+            Value::Number(20.into()),
+            Value::Number(30.into()),
+            Value::Number(40.into()),
+        ]),
+    )]);
+    assert_eq!(
+        ev.evaluate("a.slice(1, 3)[0]").unwrap(),
+        Value::Number(20.into())
+    );
+    assert_eq!(
+        ev.evaluate("a.slice(-2)[1]").unwrap(),
+        Value::Number(40.into())
+    );
+}
+
+#[test]
+fn index_into_string_slice_result() {
+    assert_eq!(ev().evaluate("'hello world'.slice(6)[0]").unwrap(), s("w"));
+    assert_eq!(ev().evaluate("'hello world'.slice(6)[4]").unwrap(), s("d"));
+    assert_eq!(ev().evaluate("'hello'.toUpperCase()[0]").unwrap(), s("H"));
+}
+
+#[test]
+fn index_into_join_result_char_by_char() {
+    // join returns a string; bracket index returns single char.
+    let ev = ev_with(&[(
+        "a",
+        Value::Array(vec![s("ab"), s("cd")]),
+    )]);
+    // "ab,cd"[2] === ","
+    assert_eq!(ev.evaluate("a.join(',')[2]").unwrap(), s(","));
+}
+
+#[test]
+fn index_result_of_object_values_chained() {
+    let mut m = serde_json::Map::new();
+    m.insert("a".into(), Value::Number(100.into()));
+    m.insert("b".into(), Value::Number(200.into()));
+    let ev = ev_with(&[("o", Value::Object(m))]);
+    // Values are alphabetical by key → [100, 200]; [1] === 200
+    assert_eq!(
+        ev.evaluate("Object.values(o)[1]").unwrap(),
+        Value::Number(200.into())
+    );
+}
