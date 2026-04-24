@@ -1,8 +1,8 @@
 use rslint_parser::{
     ast::{
-        BinExpr, BinOp, CallExpr, CondExpr, DotExpr, Expr, GroupingExpr, Name, NameRef, UnaryExpr,
-        UnaryOp,
-    }, // Removed ExprOrSpread
+        ArrayExpr, BinExpr, BinOp, BracketExpr, CallExpr, CondExpr, DotExpr, Expr, GroupingExpr,
+        LiteralProp, Name, NameRef, ObjectExpr, ObjectProp, PropName, UnaryExpr, UnaryOp,
+    },
     parse_text,
     AstNode,
     SyntaxKind,
@@ -45,7 +45,28 @@ pub struct NodeError {
 #[derive(Debug, Clone, PartialEq)]
 pub enum BuiltInMethodKind {
     ArrayIncludes,
-    ObjectHasOwnProperty, // Added
+    ArrayIndexOf,
+    ArrayJoin,
+    ArraySlice,
+    ObjectHasOwnProperty,
+    StringToUpperCase,
+    StringToLowerCase,
+    StringTrim,
+    StringIncludes,
+    StringStartsWith,
+    StringEndsWith,
+    StringSlice,
+    StringIndexOf,
+    NumberToFixed,
+    MathFloor,
+    MathCeil,
+    MathRound,
+    MathAbs,
+    MathMin,
+    MathMax,
+    ObjectKeys,
+    ObjectValues,
+    ObjectEntries,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -159,6 +180,9 @@ impl Evaluator {
             SyntaxKind::CALL_EXPR => {
                 self.evaluate_call_expr(&CallExpr::cast(node.clone()).unwrap())
             }
+            SyntaxKind::BRACKET_EXPR => {
+                self.evaluate_bracket_expr(&BracketExpr::cast(node.clone()).unwrap())
+            }
             SyntaxKind::GROUPING_EXPR => {
                 let grouping_expr = GroupingExpr::cast(node.clone()).unwrap();
                 let inner_expr = grouping_expr.inner().ok_or_else(|| {
@@ -169,30 +193,11 @@ impl Evaluator {
                 })?;
                 self.evaluate_node(inner_expr.syntax())
             }
-            // Handle simple array and object literals
             SyntaxKind::ARRAY_EXPR => {
-                // For now, only support empty array literal []
-                // Complex array literals [1,2,3] would require iterating elements
-                if node.children().count() == 0 {
-                    Ok(Value::Array(vec![]))
-                } else {
-                    Err(EvaluationError::Node(NodeError {
-                        message: "Complex array literals are not yet supported.".to_string(),
-                        node: Some(node.clone()),
-                    }))
-                }
+                self.evaluate_array_expr(&ArrayExpr::cast(node.clone()).unwrap())
             }
             SyntaxKind::OBJECT_EXPR => {
-                // For now, only support empty object literal {}
-                // Complex object literals {a:1} would require parsing properties
-                if node.children().count() == 0 {
-                    Ok(Value::Object(serde_json::Map::new()))
-                } else {
-                    Err(EvaluationError::Node(NodeError {
-                        message: "Complex object literals are not yet supported.".to_string(),
-                        node: Some(node.clone()),
-                    }))
-                }
+                self.evaluate_object_expr(&ObjectExpr::cast(node.clone()).unwrap())
             }
             _ => Err(EvaluationError::Node(NodeError {
                 message: format!("Unsupported syntax kind: {:?}", node.kind()),
@@ -422,6 +427,15 @@ impl Evaluator {
         // So we need to get its text representation.
         let prop_name = prop_name_ident.syntax().text().to_string();
 
+        // Namespace shortcut: Math.foo / Object.keys — resolve without requiring
+        // the identifier in context, but allow a context-defined binding to shadow.
+        if object_expr.syntax().kind() == SyntaxKind::NAME_REF {
+            let ns_name = object_expr.syntax().text().to_string();
+            if let Some(result) = self.resolve_namespace_member(&ns_name, &prop_name) {
+                return result;
+            }
+        }
+
         // Evaluate the object part of the dot expression
         let object_value = self.evaluate_node(object_expr.syntax())?;
 
@@ -431,45 +445,154 @@ impl Evaluator {
             prop_name
         );
 
-        match object_value {
-            Value::Array(arr) => {
-                if prop_name == "length" {
-                    Ok(ResolvableValue::Json(Value::Number(
-                        serde_json::Number::from_f64(arr.len() as f64).unwrap(),
-                    )))
-                } else if prop_name == "includes" {
-                    Ok(ResolvableValue::BuiltInMethod {
-                        object: Box::new(Value::Array(arr.clone())), // Clone the array for the method context
-                        method: BuiltInMethodKind::ArrayIncludes,
-                    })
-                } else {
-                    // Accessing other properties like myArray.foo returns undefined in JS.
-                    Ok(ResolvableValue::Json(Value::Null))
+        self.resolve_member_on_value(object_value, &prop_name)
+    }
+
+    /// Namespace lookup for Math/Object. Returns `Some(_)` if `ns_name` names a
+    /// recognized namespace that is not shadowed by the context; `None`
+    /// otherwise (so the caller falls back to normal property resolution).
+    fn resolve_namespace_member(
+        &self,
+        ns_name: &str,
+        prop_name: &str,
+    ) -> Option<Result<ResolvableValue, EvaluationError>> {
+        if ns_name == "Math" && !self.context.contains_key("Math") {
+            let method = match prop_name {
+                "floor" => BuiltInMethodKind::MathFloor,
+                "ceil" => BuiltInMethodKind::MathCeil,
+                "round" => BuiltInMethodKind::MathRound,
+                "abs" => BuiltInMethodKind::MathAbs,
+                "min" => BuiltInMethodKind::MathMin,
+                "max" => BuiltInMethodKind::MathMax,
+                _ => {
+                    return Some(Err(EvaluationError::TypeError(format!(
+                        "Math.{} is not supported",
+                        prop_name
+                    ))));
                 }
-            }
+            };
+            return Some(Ok(ResolvableValue::BuiltInMethod {
+                object: Box::new(Value::Null),
+                method,
+            }));
+        }
+        if ns_name == "Object" && !self.context.contains_key("Object") {
+            let method = match prop_name {
+                "keys" => BuiltInMethodKind::ObjectKeys,
+                "values" => BuiltInMethodKind::ObjectValues,
+                "entries" => BuiltInMethodKind::ObjectEntries,
+                _ => {
+                    return Some(Err(EvaluationError::TypeError(format!(
+                        "Object.{} is not supported",
+                        prop_name
+                    ))));
+                }
+            };
+            return Some(Ok(ResolvableValue::BuiltInMethod {
+                object: Box::new(Value::Null),
+                method,
+            }));
+        }
+        None
+    }
+
+    /// Type-dispatched property resolution shared by dot and bracket access.
+    fn resolve_member_on_value(
+        &self,
+        object: Value,
+        prop_name: &str,
+    ) -> Result<ResolvableValue, EvaluationError> {
+        match object {
+            Value::Array(arr) => match prop_name {
+                "length" => Ok(ResolvableValue::Json(Value::Number(
+                    serde_json::Number::from_f64(arr.len() as f64).unwrap(),
+                ))),
+                "includes" => Ok(ResolvableValue::BuiltInMethod {
+                    object: Box::new(Value::Array(arr)),
+                    method: BuiltInMethodKind::ArrayIncludes,
+                }),
+                "indexOf" => Ok(ResolvableValue::BuiltInMethod {
+                    object: Box::new(Value::Array(arr)),
+                    method: BuiltInMethodKind::ArrayIndexOf,
+                }),
+                "join" => Ok(ResolvableValue::BuiltInMethod {
+                    object: Box::new(Value::Array(arr)),
+                    method: BuiltInMethodKind::ArrayJoin,
+                }),
+                "slice" => Ok(ResolvableValue::BuiltInMethod {
+                    object: Box::new(Value::Array(arr)),
+                    method: BuiltInMethodKind::ArraySlice,
+                }),
+                _ => Ok(ResolvableValue::Json(Value::Null)),
+            },
             Value::Object(map) => {
-                if prop_name == "hasOwnProperty" {
-                    Ok(ResolvableValue::BuiltInMethod {
-                        object: Box::new(Value::Object(map.clone())), // Clone the object for the method context
-                        method: BuiltInMethodKind::ObjectHasOwnProperty,
-                    })
-                } else {
-                    Ok(ResolvableValue::Json(
-                        map.get(&prop_name).cloned().unwrap_or(Value::Null),
-                    ))
+                // JS semantics: own properties shadow prototype methods.
+                if let Some(v) = map.get(prop_name) {
+                    return Ok(ResolvableValue::Json(v.clone()));
                 }
+                if prop_name == "hasOwnProperty" {
+                    return Ok(ResolvableValue::BuiltInMethod {
+                        object: Box::new(Value::Object(map)),
+                        method: BuiltInMethodKind::ObjectHasOwnProperty,
+                    });
+                }
+                Ok(ResolvableValue::Json(Value::Null))
             }
+            Value::String(s) => match prop_name {
+                "length" => Ok(ResolvableValue::Json(Value::Number(
+                    serde_json::Number::from_f64(s.chars().count() as f64).unwrap(),
+                ))),
+                "toUpperCase" => Ok(ResolvableValue::BuiltInMethod {
+                    object: Box::new(Value::String(s)),
+                    method: BuiltInMethodKind::StringToUpperCase,
+                }),
+                "toLowerCase" => Ok(ResolvableValue::BuiltInMethod {
+                    object: Box::new(Value::String(s)),
+                    method: BuiltInMethodKind::StringToLowerCase,
+                }),
+                "trim" => Ok(ResolvableValue::BuiltInMethod {
+                    object: Box::new(Value::String(s)),
+                    method: BuiltInMethodKind::StringTrim,
+                }),
+                "includes" => Ok(ResolvableValue::BuiltInMethod {
+                    object: Box::new(Value::String(s)),
+                    method: BuiltInMethodKind::StringIncludes,
+                }),
+                "startsWith" => Ok(ResolvableValue::BuiltInMethod {
+                    object: Box::new(Value::String(s)),
+                    method: BuiltInMethodKind::StringStartsWith,
+                }),
+                "endsWith" => Ok(ResolvableValue::BuiltInMethod {
+                    object: Box::new(Value::String(s)),
+                    method: BuiltInMethodKind::StringEndsWith,
+                }),
+                "slice" => Ok(ResolvableValue::BuiltInMethod {
+                    object: Box::new(Value::String(s)),
+                    method: BuiltInMethodKind::StringSlice,
+                }),
+                "indexOf" => Ok(ResolvableValue::BuiltInMethod {
+                    object: Box::new(Value::String(s)),
+                    method: BuiltInMethodKind::StringIndexOf,
+                }),
+                _ => Ok(ResolvableValue::Json(Value::Null)),
+            },
+            Value::Number(n) => match prop_name {
+                "toFixed" => Ok(ResolvableValue::BuiltInMethod {
+                    object: Box::new(Value::Number(n)),
+                    method: BuiltInMethodKind::NumberToFixed,
+                }),
+                _ => Ok(ResolvableValue::Json(Value::Null)),
+            },
             _ => {
                 if prop_name == "length" {
-                    // Check for .length on non-array/non-object first
                     Err(EvaluationError::TypeError(format!(
-                        "Cannot read property 'length' of non-array/non-object value: {}", // Clarified error
-                        self.value_to_string(&object_value)
+                        "Cannot read property 'length' of non-array/non-object value: {}",
+                        self.value_to_string(&object)
                     )))
                 } else {
                     Err(EvaluationError::TypeError(format!(
                         "Cannot read properties of null or primitive value: {} (trying to access property: {})",
-                        self.value_to_string(&object_value),
+                        self.value_to_string(&object),
                         prop_name
                     )))
                 }
@@ -737,11 +860,62 @@ impl Evaluator {
     fn value_to_string(&self, value: &Value) -> String {
         match value {
             Value::String(s) => s.clone(),
-            Value::Number(n) => n.to_string(),
+            Value::Number(n) => self.canonical_number_string(n),
             Value::Bool(b) => b.to_string(),
             Value::Null => "null".to_string(),
-            Value::Array(_) => "[Array]".to_string(),
-            Value::Object(_) => "[Object]".to_string(),
+            // JS: Array.prototype.toString() === join(','), which renders null
+            // and nested arrays recursively; objects render as "[object Object]".
+            Value::Array(arr) => arr
+                .iter()
+                .map(|item| self.value_to_join_element(item))
+                .collect::<Vec<_>>()
+                .join(","),
+            Value::Object(_) => "[object Object]".to_string(),
+        }
+    }
+
+    /// Canonical JS-style stringification of a number, matching ToString for
+    /// Number: integers have no trailing ".0", NaN/Infinity use their named
+    /// forms. serde_json::Number may be backed by i64/u64/f64; we prefer the
+    /// integer form when the value represents an integer.
+    fn canonical_number_string(&self, n: &serde_json::Number) -> String {
+        if let Some(i) = n.as_i64() {
+            return i.to_string();
+        }
+        if let Some(u) = n.as_u64() {
+            return u.to_string();
+        }
+        let f = n.as_f64().unwrap();
+        if f.is_nan() {
+            return "NaN".to_string();
+        }
+        if f == 0.0 {
+            return "0".to_string();
+        }
+        if f.is_infinite() {
+            return if f > 0.0 { "Infinity".into() } else { "-Infinity".into() };
+        }
+        // Recognize the exprimo Infinity sentinel values: serde_json::Number
+        // can't store real Infinity, so the engine uses f64::MAX / f64::MIN.
+        if f == f64::MAX {
+            return "Infinity".to_string();
+        }
+        if f == f64::MIN {
+            return "-Infinity".to_string();
+        }
+        if f.fract() == 0.0 && f.abs() < (i64::MAX as f64) {
+            format!("{}", f as i64)
+        } else {
+            format!("{}", f)
+        }
+    }
+
+    /// Element-level stringification used inside arrays (for `.join` and
+    /// Array-to-string coercion). Matches JS: null/undefined → empty string.
+    fn value_to_join_element(&self, value: &Value) -> String {
+        match value {
+            Value::Null => String::new(),
+            _ => self.value_to_string(value),
         }
     }
 
@@ -795,6 +969,564 @@ impl Evaluator {
         result
     }
 
+    fn evaluate_array_expr(&self, array_expr: &ArrayExpr) -> Result<Value, EvaluationError> {
+        use rslint_parser::ast::ExprOrSpread;
+        let mut out = Vec::new();
+        for element in array_expr.elements() {
+            match element {
+                ExprOrSpread::Expr(expr) => {
+                    let v = self.evaluate_node(expr.syntax())?;
+                    out.push(v);
+                }
+                ExprOrSpread::Spread(_) => {
+                    return Err(EvaluationError::Node(NodeError {
+                        message: "Spread elements are not supported in array literals".to_string(),
+                        node: Some(array_expr.syntax().clone()),
+                    }));
+                }
+            }
+        }
+        Ok(Value::Array(out))
+    }
+
+    fn evaluate_object_expr(&self, object_expr: &ObjectExpr) -> Result<Value, EvaluationError> {
+        let mut map = serde_json::Map::new();
+        for prop in object_expr.props() {
+            match prop {
+                ObjectProp::LiteralProp(lit) => {
+                    let (key, value) = self.evaluate_literal_prop(&lit)?;
+                    map.insert(key, value);
+                }
+                _ => {
+                    return Err(EvaluationError::Node(NodeError {
+                        message: "Only plain key:value object properties are supported".to_string(),
+                        node: Some(object_expr.syntax().clone()),
+                    }));
+                }
+            }
+        }
+        Ok(Value::Object(map))
+    }
+
+    fn evaluate_literal_prop(
+        &self,
+        lit: &LiteralProp,
+    ) -> Result<(String, Value), EvaluationError> {
+        let key_node = lit.key().ok_or_else(|| {
+            EvaluationError::Node(NodeError {
+                message: "Missing key in object property".to_string(),
+                node: Some(lit.syntax().clone()),
+            })
+        })?;
+        let key = self.prop_name_to_string(&key_node)?;
+        let value_expr = lit.value().ok_or_else(|| {
+            EvaluationError::Node(NodeError {
+                message: "Missing value in object property".to_string(),
+                node: Some(lit.syntax().clone()),
+            })
+        })?;
+        let value = self.evaluate_node(value_expr.syntax())?;
+        Ok((key, value))
+    }
+
+    fn prop_name_to_string(&self, prop_name: &PropName) -> Result<String, EvaluationError> {
+        match prop_name {
+            PropName::Ident(name) => Ok(name.syntax().text().to_string()),
+            PropName::Literal(literal) => {
+                // For "foo"/'foo'/42, evaluate the literal then stringify.
+                let v = self.evaluate_node(literal.syntax())?;
+                Ok(self.value_to_string(&v))
+            }
+            PropName::Computed(computed) => {
+                // [expr] — evaluate the inner expression and stringify.
+                let inner = computed.syntax().first_child().ok_or_else(|| {
+                    EvaluationError::Node(NodeError {
+                        message: "Empty computed property key".to_string(),
+                        node: Some(computed.syntax().clone()),
+                    })
+                })?;
+                let v = self.evaluate_node(&inner)?;
+                Ok(self.value_to_string(&v))
+            }
+        }
+    }
+
+    fn evaluate_bracket_expr(
+        &self,
+        bracket_expr: &BracketExpr,
+    ) -> Result<Value, EvaluationError> {
+        trace!(
+            "Evaluating Bracket Expression: {:#?}",
+            bracket_expr.to_string()
+        );
+
+        let object_expr = bracket_expr.object().ok_or_else(|| {
+            EvaluationError::Node(NodeError {
+                message: "Missing object in bracket expression".to_string(),
+                node: Some(bracket_expr.syntax().clone()),
+            })
+        })?;
+        let prop_expr = bracket_expr.prop().ok_or_else(|| {
+            EvaluationError::Node(NodeError {
+                message: "Missing index expression in bracket expression".to_string(),
+                node: Some(bracket_expr.syntax().clone()),
+            })
+        })?;
+
+        // Namespace shortcut: Math['floor'] / Object['keys'] should resolve
+        // like their dot-access counterparts, without requiring Math/Object in
+        // context. Using a namespace method as a value (without calling it)
+        // still fails at try_into_value, matching dot-access behaviour.
+        if object_expr.syntax().kind() == SyntaxKind::NAME_REF {
+            let ns_name = object_expr.syntax().text().to_string();
+            if (ns_name == "Math" || ns_name == "Object")
+                && !self.context.contains_key(&ns_name)
+            {
+                let prop_value = self.evaluate_node(prop_expr.syntax())?;
+                let prop_name = self.value_to_string(&prop_value);
+                if let Some(result) = self.resolve_namespace_member(&ns_name, &prop_name) {
+                    return result?.try_into_value();
+                }
+            }
+        }
+
+        let object_value = self.evaluate_node(object_expr.syntax())?;
+        let prop_value = self.evaluate_node(prop_expr.syntax())?;
+
+        self.index_value(object_value, prop_value)
+    }
+
+    fn index_value(&self, object: Value, prop: Value) -> Result<Value, EvaluationError> {
+        // For Array/String, a valid non-negative integer index takes the
+        // numeric-lookup path. Any other key (including 'length',
+        // 'toUpperCase', fractional, etc.) falls through to property-style
+        // lookup via resolve_member_on_value so bracket access behaves
+        // consistently with dot access.
+        match &object {
+            Value::Array(arr) => {
+                let idx_f = self.to_number(&prop)?;
+                if !idx_f.is_nan() && idx_f == idx_f.trunc() && idx_f >= 0.0 {
+                    let idx = idx_f as usize;
+                    return Ok(arr.get(idx).cloned().unwrap_or(Value::Null));
+                }
+            }
+            Value::String(s) => {
+                let idx_f = self.to_number(&prop)?;
+                if !idx_f.is_nan() && idx_f == idx_f.trunc() && idx_f >= 0.0 {
+                    let idx = idx_f as usize;
+                    return Ok(s
+                        .chars()
+                        .nth(idx)
+                        .map(|c| Value::String(c.to_string()))
+                        .unwrap_or(Value::Null));
+                }
+            }
+            Value::Object(_) => {}
+            _ => {
+                return Err(EvaluationError::TypeError(format!(
+                    "Cannot index non-indexable value: {}",
+                    self.value_to_string(&object)
+                )));
+            }
+        }
+
+        let key = self.value_to_string(&prop);
+        let resolvable = self.resolve_member_on_value(object, &key)?;
+        resolvable.try_into_value()
+    }
+
+    fn check_arity(
+        &self,
+        expected: usize,
+        got: usize,
+    ) -> Result<(), EvaluationError> {
+        if got != expected {
+            Err(EvaluationError::CustomFunction(
+                CustomFuncError::ArityError { expected, got },
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn slice_bounds(&self, len: i64, start: i64, end: i64) -> (usize, usize) {
+        let mut s = if start < 0 { len + start } else { start };
+        let mut e = if end < 0 { len + end } else { end };
+        if s < 0 {
+            s = 0;
+        }
+        if e > len {
+            e = len;
+        }
+        if s > len {
+            s = len;
+        }
+        if e < s {
+            e = s;
+        }
+        (s as usize, e as usize)
+    }
+
+    fn arg_to_int(&self, v: &Value) -> Result<i64, EvaluationError> {
+        let f = self.to_number(v)?;
+        if f.is_nan() {
+            return Ok(0);
+        }
+        Ok(f.trunc() as i64)
+    }
+
+    fn invoke_builtin_method(
+        &self,
+        object: Value,
+        method: BuiltInMethodKind,
+        args: &[Value],
+    ) -> Result<Value, EvaluationError> {
+        match method {
+            BuiltInMethodKind::ArrayIncludes => {
+                self.check_arity(1, args.len())?;
+                if let Value::Array(arr) = object {
+                    let target = &args[0];
+                    Ok(Value::Bool(
+                        arr.iter().any(|item| self.same_value_zero(item, target)),
+                    ))
+                } else {
+                    Err(EvaluationError::TypeError(
+                        "Array.includes called on a non-array internal object.".to_string(),
+                    ))
+                }
+            }
+            BuiltInMethodKind::ArrayIndexOf => {
+                self.check_arity(1, args.len())?;
+                if let Value::Array(arr) = object {
+                    let target = &args[0];
+                    let idx = arr
+                        .iter()
+                        .position(|item| self.strict_equality(item, target));
+                    let found = match idx {
+                        Some(i) => i as f64,
+                        None => -1.0,
+                    };
+                    Ok(self.f64_to_value(found))
+                } else {
+                    Err(EvaluationError::TypeError(
+                        "Array.indexOf called on a non-array internal object.".to_string(),
+                    ))
+                }
+            }
+            BuiltInMethodKind::ArrayJoin => {
+                if args.len() > 1 {
+                    return Err(EvaluationError::CustomFunction(
+                        CustomFuncError::ArityError {
+                            expected: 1,
+                            got: args.len(),
+                        },
+                    ));
+                }
+                let sep = if args.is_empty() {
+                    ",".to_string()
+                } else {
+                    self.value_to_string(&args[0])
+                };
+                if let Value::Array(arr) = object {
+                    let parts: Vec<String> = arr
+                        .iter()
+                        .map(|v| self.value_to_join_element(v))
+                        .collect();
+                    Ok(Value::String(parts.join(&sep)))
+                } else {
+                    Err(EvaluationError::TypeError(
+                        "Array.join called on a non-array internal object.".to_string(),
+                    ))
+                }
+            }
+            BuiltInMethodKind::ArraySlice => {
+                if args.len() > 2 {
+                    return Err(EvaluationError::CustomFunction(
+                        CustomFuncError::ArityError {
+                            expected: 2,
+                            got: args.len(),
+                        },
+                    ));
+                }
+                if let Value::Array(arr) = object {
+                    let len = arr.len() as i64;
+                    let start = if args.is_empty() {
+                        0
+                    } else {
+                        self.arg_to_int(&args[0])?
+                    };
+                    let end = if args.len() < 2 {
+                        len
+                    } else {
+                        self.arg_to_int(&args[1])?
+                    };
+                    let (s, e) = self.slice_bounds(len, start, end);
+                    Ok(Value::Array(arr[s..e].to_vec()))
+                } else {
+                    Err(EvaluationError::TypeError(
+                        "Array.slice called on a non-array internal object.".to_string(),
+                    ))
+                }
+            }
+            BuiltInMethodKind::ObjectHasOwnProperty => {
+                self.check_arity(1, args.len())?;
+                let prop_key_str = self.value_to_string(&args[0]);
+                if let Value::Object(obj_map) = object {
+                    Ok(Value::Bool(obj_map.contains_key(&prop_key_str)))
+                } else {
+                    Err(EvaluationError::TypeError(
+                        "Object.hasOwnProperty called on a non-object internal object."
+                            .to_string(),
+                    ))
+                }
+            }
+            BuiltInMethodKind::StringToUpperCase => {
+                self.check_arity(0, args.len())?;
+                if let Value::String(s) = object {
+                    Ok(Value::String(s.to_uppercase()))
+                } else {
+                    Err(EvaluationError::TypeError(
+                        "String.toUpperCase called on a non-string.".to_string(),
+                    ))
+                }
+            }
+            BuiltInMethodKind::StringToLowerCase => {
+                self.check_arity(0, args.len())?;
+                if let Value::String(s) = object {
+                    Ok(Value::String(s.to_lowercase()))
+                } else {
+                    Err(EvaluationError::TypeError(
+                        "String.toLowerCase called on a non-string.".to_string(),
+                    ))
+                }
+            }
+            BuiltInMethodKind::StringTrim => {
+                self.check_arity(0, args.len())?;
+                if let Value::String(s) = object {
+                    Ok(Value::String(s.trim().to_string()))
+                } else {
+                    Err(EvaluationError::TypeError(
+                        "String.trim called on a non-string.".to_string(),
+                    ))
+                }
+            }
+            BuiltInMethodKind::StringIncludes => {
+                self.check_arity(1, args.len())?;
+                if let Value::String(s) = object {
+                    let needle = self.value_to_string(&args[0]);
+                    Ok(Value::Bool(s.contains(&needle)))
+                } else {
+                    Err(EvaluationError::TypeError(
+                        "String.includes called on a non-string.".to_string(),
+                    ))
+                }
+            }
+            BuiltInMethodKind::StringStartsWith => {
+                self.check_arity(1, args.len())?;
+                if let Value::String(s) = object {
+                    let needle = self.value_to_string(&args[0]);
+                    Ok(Value::Bool(s.starts_with(&needle)))
+                } else {
+                    Err(EvaluationError::TypeError(
+                        "String.startsWith called on a non-string.".to_string(),
+                    ))
+                }
+            }
+            BuiltInMethodKind::StringEndsWith => {
+                self.check_arity(1, args.len())?;
+                if let Value::String(s) = object {
+                    let needle = self.value_to_string(&args[0]);
+                    Ok(Value::Bool(s.ends_with(&needle)))
+                } else {
+                    Err(EvaluationError::TypeError(
+                        "String.endsWith called on a non-string.".to_string(),
+                    ))
+                }
+            }
+            BuiltInMethodKind::StringSlice => {
+                if args.len() > 2 {
+                    return Err(EvaluationError::CustomFunction(
+                        CustomFuncError::ArityError {
+                            expected: 2,
+                            got: args.len(),
+                        },
+                    ));
+                }
+                if let Value::String(s) = object {
+                    let chars: Vec<char> = s.chars().collect();
+                    let len = chars.len() as i64;
+                    let start = if args.is_empty() {
+                        0
+                    } else {
+                        self.arg_to_int(&args[0])?
+                    };
+                    let end = if args.len() < 2 {
+                        len
+                    } else {
+                        self.arg_to_int(&args[1])?
+                    };
+                    let (s_idx, e_idx) = self.slice_bounds(len, start, end);
+                    let sliced: String = chars[s_idx..e_idx].iter().collect();
+                    Ok(Value::String(sliced))
+                } else {
+                    Err(EvaluationError::TypeError(
+                        "String.slice called on a non-string.".to_string(),
+                    ))
+                }
+            }
+            BuiltInMethodKind::StringIndexOf => {
+                self.check_arity(1, args.len())?;
+                if let Value::String(s) = object {
+                    let needle = self.value_to_string(&args[0]);
+                    // JS String.indexOf returns byte-equivalent character index;
+                    // we report the char index for consistent UTF-8 semantics.
+                    match s.find(&needle) {
+                        Some(byte_idx) => {
+                            let char_idx = s[..byte_idx].chars().count() as f64;
+                            Ok(self.f64_to_value(char_idx))
+                        }
+                        None => Ok(self.f64_to_value(-1.0)),
+                    }
+                } else {
+                    Err(EvaluationError::TypeError(
+                        "String.indexOf called on a non-string.".to_string(),
+                    ))
+                }
+            }
+            BuiltInMethodKind::NumberToFixed => {
+                if args.len() > 1 {
+                    return Err(EvaluationError::CustomFunction(
+                        CustomFuncError::ArityError {
+                            expected: 1,
+                            got: args.len(),
+                        },
+                    ));
+                }
+                let digits = if args.is_empty() {
+                    0i64
+                } else {
+                    self.arg_to_int(&args[0])?
+                };
+                if !(0..=100).contains(&digits) {
+                    return Err(EvaluationError::TypeError(format!(
+                        "toFixed() digits argument must be between 0 and 100, got {}",
+                        digits
+                    )));
+                }
+                let n = self.to_number(&object)?;
+                if n.is_nan() {
+                    return Ok(Value::String("NaN".to_string()));
+                }
+                let formatted = format!("{:.*}", digits as usize, n);
+                // JS: (-0).toFixed(2) === "0.00". Strip leading '-' when the
+                // result is all zeros (optionally with a single decimal point).
+                let cleaned = if let Some(rest) = formatted.strip_prefix('-') {
+                    if rest.chars().all(|c| c == '0' || c == '.') {
+                        rest.to_string()
+                    } else {
+                        formatted
+                    }
+                } else {
+                    formatted
+                };
+                Ok(Value::String(cleaned))
+            }
+            BuiltInMethodKind::MathFloor => {
+                self.check_arity(1, args.len())?;
+                let n = self.to_number(&args[0])?;
+                Ok(self.f64_to_value(n.floor()))
+            }
+            BuiltInMethodKind::MathCeil => {
+                self.check_arity(1, args.len())?;
+                let n = self.to_number(&args[0])?;
+                Ok(self.f64_to_value(n.ceil()))
+            }
+            BuiltInMethodKind::MathRound => {
+                self.check_arity(1, args.len())?;
+                let n = self.to_number(&args[0])?;
+                // JS Math.round: round half to +Infinity
+                let rounded = if n.is_nan() {
+                    f64::NAN
+                } else {
+                    (n + 0.5).floor()
+                };
+                Ok(self.f64_to_value(rounded))
+            }
+            BuiltInMethodKind::MathAbs => {
+                self.check_arity(1, args.len())?;
+                let n = self.to_number(&args[0])?;
+                Ok(self.f64_to_value(n.abs()))
+            }
+            BuiltInMethodKind::MathMin => {
+                if args.is_empty() {
+                    return Ok(self.f64_to_value(f64::INFINITY));
+                }
+                let mut best = f64::INFINITY;
+                for arg in args {
+                    let n = self.to_number(arg)?;
+                    if n.is_nan() {
+                        return Ok(self.f64_to_value(f64::NAN));
+                    }
+                    if n < best {
+                        best = n;
+                    }
+                }
+                Ok(self.f64_to_value(best))
+            }
+            BuiltInMethodKind::MathMax => {
+                if args.is_empty() {
+                    return Ok(self.f64_to_value(f64::NEG_INFINITY));
+                }
+                let mut best = f64::NEG_INFINITY;
+                for arg in args {
+                    let n = self.to_number(arg)?;
+                    if n.is_nan() {
+                        return Ok(self.f64_to_value(f64::NAN));
+                    }
+                    if n > best {
+                        best = n;
+                    }
+                }
+                Ok(self.f64_to_value(best))
+            }
+            BuiltInMethodKind::ObjectKeys => {
+                self.check_arity(1, args.len())?;
+                match &args[0] {
+                    Value::Object(map) => Ok(Value::Array(
+                        map.keys().cloned().map(Value::String).collect(),
+                    )),
+                    _ => Err(EvaluationError::TypeError(
+                        "Object.keys called on a non-object value".to_string(),
+                    )),
+                }
+            }
+            BuiltInMethodKind::ObjectValues => {
+                self.check_arity(1, args.len())?;
+                match &args[0] {
+                    Value::Object(map) => Ok(Value::Array(map.values().cloned().collect())),
+                    _ => Err(EvaluationError::TypeError(
+                        "Object.values called on a non-object value".to_string(),
+                    )),
+                }
+            }
+            BuiltInMethodKind::ObjectEntries => {
+                self.check_arity(1, args.len())?;
+                match &args[0] {
+                    Value::Object(map) => Ok(Value::Array(
+                        map.iter()
+                            .map(|(k, v)| {
+                                Value::Array(vec![Value::String(k.clone()), v.clone()])
+                            })
+                            .collect(),
+                    )),
+                    _ => Err(EvaluationError::TypeError(
+                        "Object.entries called on a non-object value".to_string(),
+                    )),
+                }
+            }
+        }
+    }
+
     fn evaluate_call_expr(&self, call_expr: &CallExpr) -> Result<Value, EvaluationError> {
         let callee_expr_node = call_expr.callee().ok_or_else(|| {
             EvaluationError::Node(NodeError {
@@ -835,60 +1567,56 @@ impl Evaluator {
 
                 match resolvable_callee {
                     ResolvableValue::BuiltInMethod { object, method } => {
-                        match method {
-                            BuiltInMethodKind::ArrayIncludes => {
-                                if evaluated_args.len() != 1 {
-                                    return Err(EvaluationError::CustomFunction(
-                                        CustomFuncError::ArityError {
-                                            expected: 1,
-                                            got: evaluated_args.len(),
-                                        },
-                                    ));
-                                }
-                                if let Value::Array(arr) = *object {
-                                    let target_value = &evaluated_args[0];
-                                    let mut found = false;
-                                    for item in arr.iter() {
-                                        // JavaScript Array.includes uses SameValueZero comparison
-                                        // which is similar to strict equality but treats NaN as equal to NaN
-                                        if self.same_value_zero(item, target_value) {
-                                            found = true;
-                                            break;
-                                        }
-                                    }
-                                    Ok(Value::Bool(found))
-                                } else {
-                                    // This case should ideally be prevented by how BuiltInMethod is constructed in evaluate_dot_expr
-                                    Err(EvaluationError::TypeError("ArrayIncludes method called on a non-array internal object.".to_string()))
-                                }
-                            }
-                            BuiltInMethodKind::ObjectHasOwnProperty => {
-                                if evaluated_args.len() != 1 {
-                                    return Err(EvaluationError::CustomFunction(
-                                        CustomFuncError::ArityError {
-                                            expected: 1,
-                                            got: evaluated_args.len(),
-                                        },
-                                    ));
-                                }
-                                let prop_key_val = &evaluated_args[0];
-                                // Coerce argument to string, similar to JS
-                                let prop_key_str = self.value_to_string(prop_key_val);
-
-                                if let Value::Object(obj_map) = *object {
-                                    // object is the Box<Value>
-                                    Ok(Value::Bool(obj_map.contains_key(&prop_key_str)))
-                                } else {
-                                    // This should not happen if BuiltInMethod is constructed correctly
-                                    Err(EvaluationError::TypeError("ObjectHasOwnProperty method called on a non-object internal object.".to_string()))
-                                }
-                            }
-                        }
+                        self.invoke_builtin_method(*object, method, &evaluated_args)
                     }
                     ResolvableValue::Json(json_val) => Err(EvaluationError::TypeError(format!(
                         "'{}' (resulting from expression '{}') is not a function.",
                         self.value_to_string(&json_val),
                         dot_expr.syntax().text()
+                    ))),
+                }
+            }
+            SyntaxKind::BRACKET_EXPR => {
+                // Bracket-member calls: arr['join'](','), Math['floor'](x).
+                // Resolve the property name via string coercion, then reuse
+                // the same resolver the dot-call path uses.
+                let bracket = BracketExpr::cast(callee_syntax.clone()).unwrap();
+                let object_expr = bracket.object().ok_or_else(|| {
+                    EvaluationError::Node(NodeError {
+                        message: "Missing object in bracket call expression".to_string(),
+                        node: Some(callee_syntax.clone()),
+                    })
+                })?;
+                let prop_expr = bracket.prop().ok_or_else(|| {
+                    EvaluationError::Node(NodeError {
+                        message: "Missing property in bracket call expression".to_string(),
+                        node: Some(callee_syntax.clone()),
+                    })
+                })?;
+                let prop_value = self.evaluate_node(prop_expr.syntax())?;
+                let prop_name = self.value_to_string(&prop_value);
+
+                let resolvable = if object_expr.syntax().kind() == SyntaxKind::NAME_REF {
+                    let ns_name = object_expr.syntax().text().to_string();
+                    if let Some(result) = self.resolve_namespace_member(&ns_name, &prop_name) {
+                        result?
+                    } else {
+                        let obj = self.evaluate_node(object_expr.syntax())?;
+                        self.resolve_member_on_value(obj, &prop_name)?
+                    }
+                } else {
+                    let obj = self.evaluate_node(object_expr.syntax())?;
+                    self.resolve_member_on_value(obj, &prop_name)?
+                };
+
+                match resolvable {
+                    ResolvableValue::BuiltInMethod { object, method } => {
+                        self.invoke_builtin_method(*object, method, &evaluated_args)
+                    }
+                    ResolvableValue::Json(json_val) => Err(EvaluationError::TypeError(format!(
+                        "'{}' (resulting from expression '{}') is not a function.",
+                        self.value_to_string(&json_val),
+                        bracket.syntax().text()
                     ))),
                 }
             }

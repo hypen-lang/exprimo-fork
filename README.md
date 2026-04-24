@@ -22,7 +22,8 @@ Exprimo parses and evaluates JavaScript expressions efficiently and securely. It
 ✅ **Type Coercion** - Supports both loose (`==`) and strict (`===`) equality with proper type coercion  
 ✅ **Rich Type Support** - Numbers, strings, booleans, arrays, objects, null, NaN, Infinity  
 ✅ **Custom Functions** - Extend with your own Rust functions  
-✅ **Built-in Methods** - Array and object methods (`.length`, `.includes()`, `.hasOwnProperty()`)  
+✅ **Built-in Methods** - String, array, number, object methods plus `Math.*` (`.length`, `.slice()`, `.toUpperCase()`, `.toFixed()`, `Math.floor()`, ...)  
+✅ **Bracket Indexing** - `arr[0]`, `obj[key]`, `str[0]` with dynamic keys  
 ✅ **String Escapes** - Proper handling of escape sequences (`\n`, `\t`, `\\`, etc.)  
 ✅ **Production-Ready** - Comprehensive test coverage (43+ tests)
 
@@ -267,6 +268,123 @@ evaluator.evaluate("[1, 2, 3].includes(4)").unwrap();            // false
 evaluator.evaluate("[NaN].includes(NaN)").unwrap();              // true (special case)
 ```
 
+#### `.indexOf(valueToFind)`
+
+Returns the index of the first occurrence, or `-1` if not found. Uses strict equality.
+
+```rust
+evaluator.evaluate("myArray.indexOf('b')").unwrap(); // 1
+evaluator.evaluate("myArray.indexOf('z')").unwrap(); // -1
+```
+
+#### `.join(separator)`
+
+Joins array elements into a string. `null` elements render as empty strings (matching JS). Separator defaults to `","` when omitted.
+
+```rust
+evaluator.evaluate("myArray.join(', ')").unwrap(); // "a, b, c"
+evaluator.evaluate("myArray.join()").unwrap();     // "a,b,c"
+```
+
+#### `.slice(start, end)`
+
+Returns a shallow copy of a portion of the array. Supports negative indices (relative to the end). Both arguments are optional.
+
+```rust
+evaluator.evaluate("myArray.slice(1, 3)").unwrap(); // [b, c]
+evaluator.evaluate("myArray.slice(-2)").unwrap();   // last two elements
+evaluator.evaluate("myArray.slice()").unwrap();     // full copy
+```
+
+### Strings
+
+#### `.length`
+
+Returns the number of Unicode characters (not bytes).
+
+```rust
+evaluator.evaluate("'hello'.length").unwrap(); // 5
+```
+
+#### `.toUpperCase()` / `.toLowerCase()` / `.trim()`
+
+```rust
+evaluator.evaluate("'Hello'.toUpperCase()").unwrap(); // "HELLO"
+evaluator.evaluate("'Hello'.toLowerCase()").unwrap(); // "hello"
+evaluator.evaluate("'  hi  '.trim()").unwrap();       // "hi"
+```
+
+#### `.includes(substring)` / `.startsWith(prefix)` / `.endsWith(suffix)`
+
+```rust
+evaluator.evaluate("'Hello, World!'.includes('World')").unwrap();  // true
+evaluator.evaluate("'Hello'.startsWith('He')").unwrap();            // true
+evaluator.evaluate("'Hello'.endsWith('lo')").unwrap();              // true
+```
+
+#### `.slice(start, end)`
+
+Like `Array.prototype.slice`. Supports negative indices.
+
+```rust
+evaluator.evaluate("'Hello, World!'.slice(0, 5)").unwrap(); // "Hello"
+evaluator.evaluate("'Hello, World!'.slice(-6, -1)").unwrap(); // "World"
+```
+
+#### `.indexOf(substring)`
+
+Returns the character index of the first occurrence, or `-1`.
+
+```rust
+evaluator.evaluate("'Hello, World!'.indexOf('World')").unwrap(); // 7
+```
+
+### Numbers
+
+#### `.toFixed(digits)`
+
+Returns a string with the number rounded to `digits` fractional digits. `digits` defaults to `0` and must be in `0..=100`.
+
+```rust
+evaluator.evaluate("state.price.toFixed(2)").unwrap(); // "19.99"
+```
+
+### Math namespace
+
+`Math.floor`, `Math.ceil`, `Math.round`, `Math.abs`, `Math.min`, `Math.max` behave like their JavaScript counterparts.
+
+```rust
+evaluator.evaluate("Math.floor(1.9)").unwrap();     // 1
+evaluator.evaluate("Math.ceil(1.1)").unwrap();      // 2
+evaluator.evaluate("Math.round(1.5)").unwrap();     // 2 (half rounds toward +Infinity)
+evaluator.evaluate("Math.abs(-5)").unwrap();        // 5
+evaluator.evaluate("Math.min(1, 2, 3)").unwrap();   // 1
+evaluator.evaluate("Math.max(1, 2, 3)").unwrap();   // 3
+```
+
+If the context defines its own `Math` identifier, it shadows the namespace.
+
+### Object namespace
+
+`Object.keys`, `Object.values`, `Object.entries` behave like their JavaScript counterparts. Can be shadowed by a context-defined `Object`.
+
+```rust
+evaluator.evaluate("Object.keys(obj)").unwrap();    // ["a", "b", "c"]
+evaluator.evaluate("Object.values(obj)").unwrap();  // [1, 2, "three"]
+evaluator.evaluate("Object.entries(obj)").unwrap(); // [["a", 1], ["b", 2], ["c", "three"]]
+```
+
+### Bracket Indexing
+
+Arrays, objects, and strings all support `obj[expr]` indexing. Missing indices (out of range, negative, or unknown keys) return `null`.
+
+```rust
+evaluator.evaluate("state.items[0].name").unwrap();      // nested access
+evaluator.evaluate("state['items'][0]['name']").unwrap(); // equivalent with bracket form
+evaluator.evaluate("arr[i]").unwrap();                   // dynamic index
+evaluator.evaluate("'hello'[0]").unwrap();               // "h"
+```
+
 ### Objects
 
 Objects are represented by `serde_json::Value::Object`.
@@ -396,14 +514,12 @@ match result {
    - `NaN` and `Infinity` don't serialize perfectly to JSON
    - Workarounds are in place, but consider a custom `Value` type for production
 
-2. **Complex Literals**
-   - Only empty array `[]` and empty object `{}` literals are supported
-   - Complex literals like `[1, 2, 3]` or `{a: 1, b: 2}` are not yet implemented
-   - **Workaround:** Pass complex structures via context
+2. **Object Literal Ambiguity**
+   - `{a: 1}` at statement position is parsed as a block (standard JavaScript quirk)
+   - **Workaround:** Wrap in parentheses: `({a: 1})`. Array literals `[1, 2, 3]` and nested literals work directly.
 
-3. **Object Literal Ambiguity**
-   - `{}` in expression context is parsed as a block statement (JavaScript quirk)
-   - **Workaround:** Use variables or wrap in parentheses (future support)
+3. **No spread, getters/setters, shorthand properties, methods in literals**
+   - `[...arr]`, `{foo}` shorthand, `{get x() {}}` are rejected at evaluation.
 
 ## Testing
 
@@ -440,6 +556,17 @@ See [CHANGELOG.md](CHANGELOG.md) for version history.
 
 ### Recent Improvements (Latest Version)
 
+- ✅ String methods: `.length`, `.toUpperCase()`, `.toLowerCase()`, `.trim()`, `.includes()`, `.startsWith()`, `.endsWith()`, `.slice()`, `.indexOf()`
+- ✅ `Number.toFixed(digits)` for currency / fixed-precision display
+- ✅ `Math` namespace: `floor`, `ceil`, `round`, `abs`, `min`, `max`
+- ✅ `Object` namespace: `keys`, `values`, `entries`
+- ✅ Complex array/object literals: `[1, 2, 3]`, `({a: 1, b: 2})` (with nested and expression values)
+- ✅ Bracket indexing: `arr[0]`, `obj[key]`, `str[0]` with dynamic keys and type coercion (`arr[true]`, `arr['0']`, `obj[null]`)
+- ✅ Additional array methods: `.indexOf()`, `.join()`, `.slice()`
+- ✅ JS-compliant Array/Object coercion: `[1,[2,3]].join('-')` produces `"1-2,3"` (recursive), objects stringify to `"[object Object]"`
+- ✅ Bracket-member calls: `arr['join'](',')`, `Math['floor'](x)`, `obj['hasOwnProperty']('k')` all resolve like their dot-access equivalents
+- ✅ Canonical number stringification (ToString / ToPropertyKey): integer-valued numbers render without trailing `.0`; `obj[1]` now correctly looks up key `"1"`; concatenation `'x=' + 1` → `"x=1"`
+- ✅ Own-property shadowing: `({hasOwnProperty: 42}).hasOwnProperty` returns `42`, matching JS prototype-chain semantics
 - ✅ Division by zero returns `Infinity`/`NaN` instead of errors
 - ✅ Invalid type conversions return `NaN` instead of errors
 - ✅ Proper NaN comparison semantics (`NaN != NaN`)
