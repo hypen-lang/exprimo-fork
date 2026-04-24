@@ -1319,7 +1319,19 @@ impl Evaluator {
                 if n.is_nan() {
                     return Ok(Value::String("NaN".to_string()));
                 }
-                Ok(Value::String(format!("{:.*}", digits as usize, n)))
+                let formatted = format!("{:.*}", digits as usize, n);
+                // JS: (-0).toFixed(2) === "0.00". Strip leading '-' when the
+                // result is all zeros (optionally with a single decimal point).
+                let cleaned = if let Some(rest) = formatted.strip_prefix('-') {
+                    if rest.chars().all(|c| c == '0' || c == '.') {
+                        rest.to_string()
+                    } else {
+                        formatted
+                    }
+                } else {
+                    formatted
+                };
+                Ok(Value::String(cleaned))
             }
             BuiltInMethodKind::MathFloor => {
                 self.check_arity(1, args.len())?;
