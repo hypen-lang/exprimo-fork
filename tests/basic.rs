@@ -390,12 +390,17 @@ fn test_object_has_own_property_on_non_object() {
         ),
     }
 
-    // Case 2: String
+    // Case 2: String — strings don't expose hasOwnProperty; resolves to null
+    // then calling null as a function yields a "not a function" error.
     let expr_str = "myStr.hasOwnProperty('length')";
     let result_str = evaluator.evaluate(expr_str);
     match result_str {
         Err(EvaluationError::TypeError(msg)) => {
-            assert_eq!(msg, "Cannot read properties of null or primitive value: text (trying to access property: hasOwnProperty)");
+            assert!(
+                msg.contains("is not a function"),
+                "unexpected message: {}",
+                msg
+            );
         }
         _ => panic!(
             "Expected TypeError for myStr.hasOwnProperty, got {:?}",
@@ -514,18 +519,31 @@ fn test_array_includes_arity_error() {
 
 #[test]
 fn test_array_includes_on_non_array() {
+    // Strings now also support .includes — verify it behaves like String.includes,
+    // and that .includes on a null/primitive object still errors.
     let mut context = HashMap::new();
-    context.insert("notAnArray".to_string(), Value::String("hello".to_string()));
+    context.insert("aStr".to_string(), Value::String("hello".to_string()));
+    context.insert("aNull".to_string(), Value::Null);
     let evaluator = Evaluator::new(context, HashMap::new());
 
-    let result = evaluator.evaluate("notAnArray.includes(1)");
+    // String.includes: substring search
+    assert_eq!(
+        evaluator.evaluate("aStr.includes('ell')").unwrap(),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        evaluator.evaluate("aStr.includes('xyz')").unwrap(),
+        Value::Bool(false)
+    );
+
+    // .includes on null still errors
+    let result = evaluator.evaluate("aNull.includes(1)");
     match result {
         Err(EvaluationError::TypeError(msg)) => {
-            // This error is from evaluate_dot_expr directly when trying to access 'includes' on a string "hello".
-            assert_eq!(msg, "Cannot read properties of null or primitive value: hello (trying to access property: includes)");
+            assert!(msg.contains("Cannot read properties of null or primitive value: null"));
         }
         _ => panic!(
-            "Expected TypeError when calling .includes on non-array, got {:?}",
+            "Expected TypeError when calling .includes on null, got {:?}",
             result
         ),
     }
@@ -715,28 +733,16 @@ fn test_length_on_non_array() {
 
     let evaluator = Evaluator::new(context.clone(), HashMap::new());
 
-    // String.length is not yet implemented, should fall into the generic "cannot read props of primitive" or specific "length" error
-    let res_str = evaluator.evaluate("myString.length");
-    match res_str {
-        Err(EvaluationError::TypeError(msg)) => {
-            assert_eq!(
-                msg,
-                "Cannot read property 'length' of non-array/non-object value: hello"
-            );
-        }
-        _ => panic!("Expected TypeError for string.length, got {:?}", res_str),
-    }
+    // String.length returns the number of characters
+    let res_str = evaluator.evaluate("myString.length").unwrap();
+    assert_eq!(
+        res_str,
+        Value::Number(serde_json::Number::from_f64(5.0).unwrap())
+    );
 
-    let res_num = evaluator.evaluate("myNum.length");
-    match res_num {
-        Err(EvaluationError::TypeError(msg)) => {
-            assert_eq!(
-                msg,
-                "Cannot read property 'length' of non-array/non-object value: 123"
-            );
-        }
-        _ => panic!("Expected TypeError for number.length, got {:?}", res_num),
-    }
+    // Numbers don't expose .length — returns null (JS undefined equivalent)
+    let res_num = evaluator.evaluate("myNum.length").unwrap();
+    assert_eq!(res_num, Value::Null);
 
     // Accessing .length on an object that doesn't have it should return Value::Null
     let res_obj = evaluator.evaluate("myObj.length").unwrap();
@@ -818,6 +824,9 @@ fn test_property_access_on_nested_object() {
 
 #[test]
 fn test_property_access_on_null_or_primitive_object_error() {
+    // Strings and numbers expose some built-in properties; accessing an unknown
+    // property on them returns null (JS undefined equivalent). Booleans and null
+    // still error on property access.
     let mut context = HashMap::new();
     context.insert("s".to_string(), Value::String("text".to_string()));
     context.insert("n".to_string(), Value::Number(123.into()));
@@ -826,17 +835,511 @@ fn test_property_access_on_null_or_primitive_object_error() {
 
     let evaluator = Evaluator::new(context, HashMap::new());
 
-    let cases = vec!["s.foo", "n.bar", "b.baz", "nl.qux"];
-    for case in cases {
+    // Unknown property on a string or number → null
+    assert_eq!(evaluator.evaluate("s.foo").unwrap(), Value::Null);
+    assert_eq!(evaluator.evaluate("n.bar").unwrap(), Value::Null);
+
+    // Property access on bool / null still errors
+    for case in &["b.baz", "nl.qux"] {
         let result = evaluator.evaluate(case);
         match result {
             Err(EvaluationError::TypeError(msg)) => {
                 assert!(msg.starts_with("Cannot read properties of null or primitive value:"));
             }
             _ => panic!(
-                "Expected TypeError for property access on primitive/null, got {:?}",
-                result
+                "Expected TypeError for property access on primitive/null ({}), got {:?}",
+                case, result
             ),
         }
     }
+}
+
+// --- String property and method tests ---
+
+fn num(v: f64) -> Value {
+    Value::Number(serde_json::Number::from_f64(v).unwrap())
+}
+
+fn with_str_context() -> Evaluator {
+    let mut context = HashMap::new();
+    context.insert("s".to_string(), Value::String("Hello, World!".to_string()));
+    context.insert("empty".to_string(), Value::String(String::new()));
+    context.insert("padded".to_string(), Value::String("  spaced  ".to_string()));
+    Evaluator::new(context, HashMap::new())
+}
+
+#[test]
+fn test_string_length() {
+    let ev = with_str_context();
+    assert_eq!(ev.evaluate("s.length").unwrap(), num(13.0));
+    assert_eq!(ev.evaluate("empty.length").unwrap(), num(0.0));
+    // length counts characters, not bytes
+    let mut ctx = HashMap::new();
+    ctx.insert("u".to_string(), Value::String("héllo".to_string()));
+    let ev2 = Evaluator::new(ctx, HashMap::new());
+    assert_eq!(ev2.evaluate("u.length").unwrap(), num(5.0));
+}
+
+#[test]
+fn test_string_case_conversion() {
+    let ev = with_str_context();
+    assert_eq!(
+        ev.evaluate("s.toUpperCase()").unwrap(),
+        Value::String("HELLO, WORLD!".to_string())
+    );
+    assert_eq!(
+        ev.evaluate("s.toLowerCase()").unwrap(),
+        Value::String("hello, world!".to_string())
+    );
+}
+
+#[test]
+fn test_string_trim() {
+    let ev = with_str_context();
+    assert_eq!(
+        ev.evaluate("padded.trim()").unwrap(),
+        Value::String("spaced".to_string())
+    );
+    assert_eq!(
+        ev.evaluate("empty.trim()").unwrap(),
+        Value::String(String::new())
+    );
+}
+
+#[test]
+fn test_string_includes_starts_ends_with() {
+    let ev = with_str_context();
+    assert_eq!(ev.evaluate("s.includes('World')").unwrap(), Value::Bool(true));
+    assert_eq!(ev.evaluate("s.includes('world')").unwrap(), Value::Bool(false));
+    assert_eq!(ev.evaluate("s.startsWith('Hello')").unwrap(), Value::Bool(true));
+    assert_eq!(ev.evaluate("s.startsWith('Hi')").unwrap(), Value::Bool(false));
+    assert_eq!(ev.evaluate("s.endsWith('!')").unwrap(), Value::Bool(true));
+    assert_eq!(ev.evaluate("s.endsWith('?')").unwrap(), Value::Bool(false));
+}
+
+#[test]
+fn test_string_slice() {
+    let ev = with_str_context();
+    assert_eq!(
+        ev.evaluate("s.slice(0, 5)").unwrap(),
+        Value::String("Hello".to_string())
+    );
+    assert_eq!(
+        ev.evaluate("s.slice(7)").unwrap(),
+        Value::String("World!".to_string())
+    );
+    // negative indices relative to end
+    assert_eq!(
+        ev.evaluate("s.slice(-6, -1)").unwrap(),
+        Value::String("World".to_string())
+    );
+    // end before start returns empty
+    assert_eq!(
+        ev.evaluate("s.slice(5, 2)").unwrap(),
+        Value::String(String::new())
+    );
+    // out-of-range end is clamped
+    assert_eq!(
+        ev.evaluate("s.slice(0, 100)").unwrap(),
+        Value::String("Hello, World!".to_string())
+    );
+}
+
+#[test]
+fn test_string_index_of() {
+    let ev = with_str_context();
+    assert_eq!(ev.evaluate("s.indexOf('World')").unwrap(), num(7.0));
+    assert_eq!(ev.evaluate("s.indexOf('xxx')").unwrap(), num(-1.0));
+    assert_eq!(ev.evaluate("s.indexOf('H')").unwrap(), num(0.0));
+}
+
+// --- Number.toFixed tests ---
+
+#[test]
+fn test_number_to_fixed() {
+    let mut ctx = HashMap::new();
+    ctx.insert("price".to_string(), num(3.144));
+    ctx.insert("n".to_string(), num(2.0));
+    ctx.insert("big".to_string(), num(1234.5));
+    let ev = Evaluator::new(ctx, HashMap::new());
+
+    assert_eq!(
+        ev.evaluate("price.toFixed(2)").unwrap(),
+        Value::String("3.14".to_string())
+    );
+    assert_eq!(
+        ev.evaluate("price.toFixed(0)").unwrap(),
+        Value::String("3".to_string())
+    );
+    assert_eq!(
+        ev.evaluate("big.toFixed(2)").unwrap(),
+        Value::String("1234.50".to_string())
+    );
+    // default (no args) is 0 digits
+    assert_eq!(
+        ev.evaluate("n.toFixed()").unwrap(),
+        Value::String("2".to_string())
+    );
+    // negative numbers
+    let mut ctx2 = HashMap::new();
+    ctx2.insert("neg".to_string(), num(-1.2345));
+    let ev2 = Evaluator::new(ctx2, HashMap::new());
+    assert_eq!(
+        ev2.evaluate("neg.toFixed(2)").unwrap(),
+        Value::String("-1.23".to_string())
+    );
+}
+
+#[test]
+fn test_number_to_fixed_out_of_range() {
+    let mut ctx = HashMap::new();
+    ctx.insert("n".to_string(), num(1.0));
+    let ev = Evaluator::new(ctx, HashMap::new());
+    match ev.evaluate("n.toFixed(-1)") {
+        Err(EvaluationError::TypeError(_)) => {}
+        other => panic!("Expected TypeError for toFixed(-1), got {:?}", other),
+    }
+    match ev.evaluate("n.toFixed(101)") {
+        Err(EvaluationError::TypeError(_)) => {}
+        other => panic!("Expected TypeError for toFixed(101), got {:?}", other),
+    }
+}
+
+// --- Math namespace tests ---
+
+#[test]
+fn test_math_floor_ceil_round() {
+    let ev = Evaluator::new(HashMap::new(), HashMap::new());
+    assert_eq!(ev.evaluate("Math.floor(1.9)").unwrap(), num(1.0));
+    assert_eq!(ev.evaluate("Math.floor(-1.1)").unwrap(), num(-2.0));
+    assert_eq!(ev.evaluate("Math.ceil(1.1)").unwrap(), num(2.0));
+    assert_eq!(ev.evaluate("Math.ceil(-1.9)").unwrap(), num(-1.0));
+    assert_eq!(ev.evaluate("Math.round(1.4)").unwrap(), num(1.0));
+    assert_eq!(ev.evaluate("Math.round(1.5)").unwrap(), num(2.0));
+    // JS semantics: half rounds toward +Infinity
+    assert_eq!(ev.evaluate("Math.round(-1.5)").unwrap(), num(-1.0));
+}
+
+#[test]
+fn test_math_abs_min_max() {
+    let ev = Evaluator::new(HashMap::new(), HashMap::new());
+    assert_eq!(ev.evaluate("Math.abs(-5)").unwrap(), num(5.0));
+    assert_eq!(ev.evaluate("Math.abs(3)").unwrap(), num(3.0));
+    assert_eq!(ev.evaluate("Math.min(1, 2, 3)").unwrap(), num(1.0));
+    assert_eq!(ev.evaluate("Math.max(1, 2, 3)").unwrap(), num(3.0));
+    assert_eq!(ev.evaluate("Math.min(-1, -2)").unwrap(), num(-2.0));
+    // Math.min() with no args in JS returns Infinity
+    match ev.evaluate("Math.min()") {
+        Ok(Value::Number(n)) => assert!(n.as_f64().unwrap() > 1e300),
+        other => panic!("Expected large number for Math.min(), got {:?}", other),
+    }
+}
+
+#[test]
+fn test_math_unknown_method() {
+    let ev = Evaluator::new(HashMap::new(), HashMap::new());
+    match ev.evaluate("Math.foo(1)") {
+        Err(EvaluationError::TypeError(msg)) => {
+            assert!(msg.contains("Math.foo"));
+        }
+        other => panic!("Expected TypeError for Math.foo, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_math_shadowed_by_context() {
+    // A user-defined `Math` in context should shadow the namespace.
+    let mut ctx = HashMap::new();
+    let mut m = serde_json::Map::new();
+    m.insert("custom".to_string(), Value::String("shadowed".to_string()));
+    ctx.insert("Math".to_string(), Value::Object(m));
+    let ev = Evaluator::new(ctx, HashMap::new());
+    assert_eq!(
+        ev.evaluate("Math.custom").unwrap(),
+        Value::String("shadowed".to_string())
+    );
+}
+
+// --- Bracket indexing tests ---
+
+#[test]
+fn test_bracket_index_array() {
+    let mut ctx = HashMap::new();
+    ctx.insert(
+        "arr".to_string(),
+        Value::Array(vec![
+            Value::String("a".to_string()),
+            Value::String("b".to_string()),
+            Value::String("c".to_string()),
+        ]),
+    );
+    ctx.insert("i".to_string(), num(1.0));
+    let ev = Evaluator::new(ctx, HashMap::new());
+
+    assert_eq!(
+        ev.evaluate("arr[0]").unwrap(),
+        Value::String("a".to_string())
+    );
+    assert_eq!(
+        ev.evaluate("arr[2]").unwrap(),
+        Value::String("c".to_string())
+    );
+    // dynamic index
+    assert_eq!(
+        ev.evaluate("arr[i]").unwrap(),
+        Value::String("b".to_string())
+    );
+    // out of range → null
+    assert_eq!(ev.evaluate("arr[99]").unwrap(), Value::Null);
+    // negative index → null (not Python-like wrap-around)
+    assert_eq!(ev.evaluate("arr[-1]").unwrap(), Value::Null);
+}
+
+#[test]
+fn test_bracket_index_object() {
+    let mut ctx = HashMap::new();
+    let mut m = serde_json::Map::new();
+    m.insert("name".to_string(), Value::String("Alice".to_string()));
+    m.insert("age".to_string(), num(30.0));
+    ctx.insert("obj".to_string(), Value::Object(m));
+    ctx.insert("key".to_string(), Value::String("name".to_string()));
+    let ev = Evaluator::new(ctx, HashMap::new());
+
+    assert_eq!(
+        ev.evaluate("obj['name']").unwrap(),
+        Value::String("Alice".to_string())
+    );
+    assert_eq!(ev.evaluate("obj[\"age\"]").unwrap(), num(30.0));
+    // dynamic key
+    assert_eq!(
+        ev.evaluate("obj[key]").unwrap(),
+        Value::String("Alice".to_string())
+    );
+    // missing key → null
+    assert_eq!(ev.evaluate("obj['missing']").unwrap(), Value::Null);
+}
+
+#[test]
+fn test_bracket_index_string() {
+    let mut ctx = HashMap::new();
+    ctx.insert("s".to_string(), Value::String("hello".to_string()));
+    let ev = Evaluator::new(ctx, HashMap::new());
+
+    assert_eq!(
+        ev.evaluate("s[0]").unwrap(),
+        Value::String("h".to_string())
+    );
+    assert_eq!(
+        ev.evaluate("s[4]").unwrap(),
+        Value::String("o".to_string())
+    );
+    assert_eq!(ev.evaluate("s[99]").unwrap(), Value::Null);
+}
+
+#[test]
+fn test_bracket_index_chained() {
+    let mut ctx = HashMap::new();
+    let mut item = serde_json::Map::new();
+    item.insert("name".to_string(), Value::String("first".to_string()));
+    let arr = Value::Array(vec![Value::Object(item)]);
+    let mut root = serde_json::Map::new();
+    root.insert("items".to_string(), arr);
+    ctx.insert("state".to_string(), Value::Object(root));
+    let ev = Evaluator::new(ctx, HashMap::new());
+
+    assert_eq!(
+        ev.evaluate("state.items[0].name").unwrap(),
+        Value::String("first".to_string())
+    );
+    assert_eq!(
+        ev.evaluate("state['items'][0]['name']").unwrap(),
+        Value::String("first".to_string())
+    );
+}
+
+// --- Array methods tests ---
+
+fn with_arr_context() -> Evaluator {
+    let mut ctx = HashMap::new();
+    ctx.insert(
+        "arr".to_string(),
+        Value::Array(vec![
+            Value::String("a".to_string()),
+            Value::String("b".to_string()),
+            Value::String("c".to_string()),
+            Value::String("d".to_string()),
+        ]),
+    );
+    ctx.insert(
+        "nums".to_string(),
+        Value::Array(vec![
+            Value::Number(10.into()),
+            Value::Number(20.into()),
+            Value::Number(30.into()),
+        ]),
+    );
+    Evaluator::new(ctx, HashMap::new())
+}
+
+#[test]
+fn test_array_index_of() {
+    let ev = with_arr_context();
+    assert_eq!(ev.evaluate("arr.indexOf('b')").unwrap(), num(1.0));
+    assert_eq!(ev.evaluate("arr.indexOf('z')").unwrap(), num(-1.0));
+    // Number context values are integer-typed; the literal 20 parses as a float,
+    // so strict equality here matches numerically (20.0 == 20).
+    assert_eq!(ev.evaluate("nums.indexOf(20)").unwrap(), num(1.0));
+    // strict equality: 20 !== "20"
+    assert_eq!(ev.evaluate("nums.indexOf('20')").unwrap(), num(-1.0));
+}
+
+#[test]
+fn test_array_join() {
+    let ev = with_arr_context();
+    assert_eq!(
+        ev.evaluate("arr.join(', ')").unwrap(),
+        Value::String("a, b, c, d".to_string())
+    );
+    assert_eq!(
+        ev.evaluate("arr.join('')").unwrap(),
+        Value::String("abcd".to_string())
+    );
+    // default separator is ","
+    assert_eq!(
+        ev.evaluate("arr.join()").unwrap(),
+        Value::String("a,b,c,d".to_string())
+    );
+    // numbers get stringified
+    assert_eq!(
+        ev.evaluate("nums.join('-')").unwrap(),
+        Value::String("10-20-30".to_string())
+    );
+    // null entries render as empty string, matching JS
+    let mut ctx2 = HashMap::new();
+    ctx2.insert(
+        "mixed".to_string(),
+        Value::Array(vec![
+            Value::Number(1.into()),
+            Value::Null,
+            Value::Number(3.into()),
+        ]),
+    );
+    let ev2 = Evaluator::new(ctx2, HashMap::new());
+    assert_eq!(
+        ev2.evaluate("mixed.join('-')").unwrap(),
+        Value::String("1--3".to_string())
+    );
+}
+
+#[test]
+fn test_array_slice() {
+    let ev = with_arr_context();
+    // [b, c]
+    let r = ev.evaluate("arr.slice(1, 3)").unwrap();
+    assert_eq!(
+        r,
+        Value::Array(vec![
+            Value::String("b".to_string()),
+            Value::String("c".to_string()),
+        ])
+    );
+    // from index to end
+    let r2 = ev.evaluate("arr.slice(2)").unwrap();
+    assert_eq!(
+        r2,
+        Value::Array(vec![
+            Value::String("c".to_string()),
+            Value::String("d".to_string()),
+        ])
+    );
+    // negative start
+    let r3 = ev.evaluate("arr.slice(-2)").unwrap();
+    assert_eq!(
+        r3,
+        Value::Array(vec![
+            Value::String("c".to_string()),
+            Value::String("d".to_string()),
+        ])
+    );
+    // empty slice
+    assert_eq!(
+        ev.evaluate("arr.slice(3, 1)").unwrap(),
+        Value::Array(vec![])
+    );
+    // no-arg → full copy
+    let r4 = ev.evaluate("arr.slice()").unwrap();
+    assert_eq!(
+        r4,
+        Value::Array(vec![
+            Value::String("a".to_string()),
+            Value::String("b".to_string()),
+            Value::String("c".to_string()),
+            Value::String("d".to_string()),
+        ])
+    );
+}
+
+// --- Integration: survey bug #2 scenario ---
+
+#[test]
+fn test_hypen_bug_2_empty_state() {
+    // The "empty state" DSL condition from the survey
+    let mut ctx = HashMap::new();
+    ctx.insert("state".to_string(), Value::String(String::new()));
+    let ev = Evaluator::new(ctx, HashMap::new());
+    assert_eq!(ev.evaluate("state.length == 0").unwrap(), Value::Bool(true));
+
+    let mut ctx2 = HashMap::new();
+    ctx2.insert("state".to_string(), Value::String("hi".to_string()));
+    let ev2 = Evaluator::new(ctx2, HashMap::new());
+    assert_eq!(ev2.evaluate("state.length == 0").unwrap(), Value::Bool(false));
+}
+
+#[test]
+fn test_hypen_currency_display() {
+    let mut ctx = HashMap::new();
+    let mut m = serde_json::Map::new();
+    m.insert("price".to_string(), num(19.995));
+    ctx.insert("state".to_string(), Value::Object(m));
+    let ev = Evaluator::new(ctx, HashMap::new());
+    assert_eq!(
+        ev.evaluate("state.price.toFixed(2)").unwrap(),
+        Value::String("20.00".to_string())
+    );
+}
+
+#[test]
+fn test_hypen_truncated_bio() {
+    let mut ctx = HashMap::new();
+    let mut m = serde_json::Map::new();
+    m.insert(
+        "bio".to_string(),
+        Value::String("A very long bio that should be truncated.".to_string()),
+    );
+    ctx.insert("state".to_string(), Value::Object(m));
+    let ev = Evaluator::new(ctx, HashMap::new());
+    assert_eq!(
+        ev.evaluate("state.bio.slice(0, 11) + '…'").unwrap(),
+        Value::String("A very long…".to_string())
+    );
+}
+
+#[test]
+fn test_hypen_tags_join() {
+    let mut ctx = HashMap::new();
+    let mut m = serde_json::Map::new();
+    m.insert(
+        "tags".to_string(),
+        Value::Array(vec![
+            Value::String("rust".to_string()),
+            Value::String("dsl".to_string()),
+            Value::String("eval".to_string()),
+        ]),
+    );
+    ctx.insert("state".to_string(), Value::Object(m));
+    let ev = Evaluator::new(ctx, HashMap::new());
+    assert_eq!(
+        ev.evaluate("state.tags.join(', ')").unwrap(),
+        Value::String("rust, dsl, eval".to_string())
+    );
 }
