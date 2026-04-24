@@ -431,42 +431,8 @@ impl Evaluator {
         // the identifier in context, but allow a context-defined binding to shadow.
         if object_expr.syntax().kind() == SyntaxKind::NAME_REF {
             let ns_name = object_expr.syntax().text().to_string();
-            if ns_name == "Math" && !self.context.contains_key("Math") {
-                let method = match prop_name.as_str() {
-                    "floor" => BuiltInMethodKind::MathFloor,
-                    "ceil" => BuiltInMethodKind::MathCeil,
-                    "round" => BuiltInMethodKind::MathRound,
-                    "abs" => BuiltInMethodKind::MathAbs,
-                    "min" => BuiltInMethodKind::MathMin,
-                    "max" => BuiltInMethodKind::MathMax,
-                    _ => {
-                        return Err(EvaluationError::TypeError(format!(
-                            "Math.{} is not supported",
-                            prop_name
-                        )));
-                    }
-                };
-                return Ok(ResolvableValue::BuiltInMethod {
-                    object: Box::new(Value::Null),
-                    method,
-                });
-            }
-            if ns_name == "Object" && !self.context.contains_key("Object") {
-                let method = match prop_name.as_str() {
-                    "keys" => BuiltInMethodKind::ObjectKeys,
-                    "values" => BuiltInMethodKind::ObjectValues,
-                    "entries" => BuiltInMethodKind::ObjectEntries,
-                    _ => {
-                        return Err(EvaluationError::TypeError(format!(
-                            "Object.{} is not supported",
-                            prop_name
-                        )));
-                    }
-                };
-                return Ok(ResolvableValue::BuiltInMethod {
-                    object: Box::new(Value::Null),
-                    method,
-                });
+            if let Some(result) = self.resolve_namespace_member(&ns_name, &prop_name) {
+                return result;
             }
         }
 
@@ -479,8 +445,65 @@ impl Evaluator {
             prop_name
         );
 
-        match object_value {
-            Value::Array(arr) => match prop_name.as_str() {
+        self.resolve_member_on_value(object_value, &prop_name)
+    }
+
+    /// Namespace lookup for Math/Object. Returns `Some(_)` if `ns_name` names a
+    /// recognized namespace that is not shadowed by the context; `None`
+    /// otherwise (so the caller falls back to normal property resolution).
+    fn resolve_namespace_member(
+        &self,
+        ns_name: &str,
+        prop_name: &str,
+    ) -> Option<Result<ResolvableValue, EvaluationError>> {
+        if ns_name == "Math" && !self.context.contains_key("Math") {
+            let method = match prop_name {
+                "floor" => BuiltInMethodKind::MathFloor,
+                "ceil" => BuiltInMethodKind::MathCeil,
+                "round" => BuiltInMethodKind::MathRound,
+                "abs" => BuiltInMethodKind::MathAbs,
+                "min" => BuiltInMethodKind::MathMin,
+                "max" => BuiltInMethodKind::MathMax,
+                _ => {
+                    return Some(Err(EvaluationError::TypeError(format!(
+                        "Math.{} is not supported",
+                        prop_name
+                    ))));
+                }
+            };
+            return Some(Ok(ResolvableValue::BuiltInMethod {
+                object: Box::new(Value::Null),
+                method,
+            }));
+        }
+        if ns_name == "Object" && !self.context.contains_key("Object") {
+            let method = match prop_name {
+                "keys" => BuiltInMethodKind::ObjectKeys,
+                "values" => BuiltInMethodKind::ObjectValues,
+                "entries" => BuiltInMethodKind::ObjectEntries,
+                _ => {
+                    return Some(Err(EvaluationError::TypeError(format!(
+                        "Object.{} is not supported",
+                        prop_name
+                    ))));
+                }
+            };
+            return Some(Ok(ResolvableValue::BuiltInMethod {
+                object: Box::new(Value::Null),
+                method,
+            }));
+        }
+        None
+    }
+
+    /// Type-dispatched property resolution shared by dot and bracket access.
+    fn resolve_member_on_value(
+        &self,
+        object: Value,
+        prop_name: &str,
+    ) -> Result<ResolvableValue, EvaluationError> {
+        match object {
+            Value::Array(arr) => match prop_name {
                 "length" => Ok(ResolvableValue::Json(Value::Number(
                     serde_json::Number::from_f64(arr.len() as f64).unwrap(),
                 ))),
@@ -502,16 +525,20 @@ impl Evaluator {
                 }),
                 _ => Ok(ResolvableValue::Json(Value::Null)),
             },
-            Value::Object(map) => match prop_name.as_str() {
-                "hasOwnProperty" => Ok(ResolvableValue::BuiltInMethod {
-                    object: Box::new(Value::Object(map)),
-                    method: BuiltInMethodKind::ObjectHasOwnProperty,
-                }),
-                _ => Ok(ResolvableValue::Json(
-                    map.get(&prop_name).cloned().unwrap_or(Value::Null),
-                )),
-            },
-            Value::String(s) => match prop_name.as_str() {
+            Value::Object(map) => {
+                // JS semantics: own properties shadow prototype methods.
+                if let Some(v) = map.get(prop_name) {
+                    return Ok(ResolvableValue::Json(v.clone()));
+                }
+                if prop_name == "hasOwnProperty" {
+                    return Ok(ResolvableValue::BuiltInMethod {
+                        object: Box::new(Value::Object(map)),
+                        method: BuiltInMethodKind::ObjectHasOwnProperty,
+                    });
+                }
+                Ok(ResolvableValue::Json(Value::Null))
+            }
+            Value::String(s) => match prop_name {
                 "length" => Ok(ResolvableValue::Json(Value::Number(
                     serde_json::Number::from_f64(s.chars().count() as f64).unwrap(),
                 ))),
@@ -549,7 +576,7 @@ impl Evaluator {
                 }),
                 _ => Ok(ResolvableValue::Json(Value::Null)),
             },
-            Value::Number(n) => match prop_name.as_str() {
+            Value::Number(n) => match prop_name {
                 "toFixed" => Ok(ResolvableValue::BuiltInMethod {
                     object: Box::new(Value::Number(n)),
                     method: BuiltInMethodKind::NumberToFixed,
@@ -558,15 +585,14 @@ impl Evaluator {
             },
             _ => {
                 if prop_name == "length" {
-                    // Check for .length on non-array/non-object/non-string first
                     Err(EvaluationError::TypeError(format!(
                         "Cannot read property 'length' of non-array/non-object value: {}",
-                        self.value_to_string(&object_value)
+                        self.value_to_string(&object)
                     )))
                 } else {
                     Err(EvaluationError::TypeError(format!(
                         "Cannot read properties of null or primitive value: {} (trying to access property: {})",
-                        self.value_to_string(&object_value),
+                        self.value_to_string(&object),
                         prop_name
                     )))
                 }
@@ -834,7 +860,7 @@ impl Evaluator {
     fn value_to_string(&self, value: &Value) -> String {
         match value {
             Value::String(s) => s.clone(),
-            Value::Number(n) => n.to_string(),
+            Value::Number(n) => self.canonical_number_string(n),
             Value::Bool(b) => b.to_string(),
             Value::Null => "null".to_string(),
             // JS: Array.prototype.toString() === join(','), which renders null
@@ -845,6 +871,42 @@ impl Evaluator {
                 .collect::<Vec<_>>()
                 .join(","),
             Value::Object(_) => "[object Object]".to_string(),
+        }
+    }
+
+    /// Canonical JS-style stringification of a number, matching ToString for
+    /// Number: integers have no trailing ".0", NaN/Infinity use their named
+    /// forms. serde_json::Number may be backed by i64/u64/f64; we prefer the
+    /// integer form when the value represents an integer.
+    fn canonical_number_string(&self, n: &serde_json::Number) -> String {
+        if let Some(i) = n.as_i64() {
+            return i.to_string();
+        }
+        if let Some(u) = n.as_u64() {
+            return u.to_string();
+        }
+        let f = n.as_f64().unwrap();
+        if f.is_nan() {
+            return "NaN".to_string();
+        }
+        if f == 0.0 {
+            return "0".to_string();
+        }
+        if f.is_infinite() {
+            return if f > 0.0 { "Infinity".into() } else { "-Infinity".into() };
+        }
+        // Recognize the exprimo Infinity sentinel values: serde_json::Number
+        // can't store real Infinity, so the engine uses f64::MAX / f64::MIN.
+        if f == f64::MAX {
+            return "Infinity".to_string();
+        }
+        if f == f64::MIN {
+            return "-Infinity".to_string();
+        }
+        if f.fract() == 0.0 && f.abs() < (i64::MAX as f64) {
+            format!("{}", f as i64)
+        } else {
+            format!("{}", f)
         }
     }
 
@@ -1011,6 +1073,23 @@ impl Evaluator {
             })
         })?;
 
+        // Namespace shortcut: Math['floor'] / Object['keys'] should resolve
+        // like their dot-access counterparts, without requiring Math/Object in
+        // context. Using a namespace method as a value (without calling it)
+        // still fails at try_into_value, matching dot-access behaviour.
+        if object_expr.syntax().kind() == SyntaxKind::NAME_REF {
+            let ns_name = object_expr.syntax().text().to_string();
+            if (ns_name == "Math" || ns_name == "Object")
+                && !self.context.contains_key(&ns_name)
+            {
+                let prop_value = self.evaluate_node(prop_expr.syntax())?;
+                let prop_name = self.value_to_string(&prop_value);
+                if let Some(result) = self.resolve_namespace_member(&ns_name, &prop_name) {
+                    return result?.try_into_value();
+                }
+            }
+        }
+
         let object_value = self.evaluate_node(object_expr.syntax())?;
         let prop_value = self.evaluate_node(prop_expr.syntax())?;
 
@@ -1018,35 +1097,42 @@ impl Evaluator {
     }
 
     fn index_value(&self, object: Value, prop: Value) -> Result<Value, EvaluationError> {
-        match object {
+        // For Array/String, a valid non-negative integer index takes the
+        // numeric-lookup path. Any other key (including 'length',
+        // 'toUpperCase', fractional, etc.) falls through to property-style
+        // lookup via resolve_member_on_value so bracket access behaves
+        // consistently with dot access.
+        match &object {
             Value::Array(arr) => {
                 let idx_f = self.to_number(&prop)?;
-                if idx_f.is_nan() || idx_f != idx_f.trunc() || idx_f < 0.0 {
-                    return Ok(Value::Null);
+                if !idx_f.is_nan() && idx_f == idx_f.trunc() && idx_f >= 0.0 {
+                    let idx = idx_f as usize;
+                    return Ok(arr.get(idx).cloned().unwrap_or(Value::Null));
                 }
-                let idx = idx_f as usize;
-                Ok(arr.get(idx).cloned().unwrap_or(Value::Null))
-            }
-            Value::Object(map) => {
-                let key = self.value_to_string(&prop);
-                Ok(map.get(&key).cloned().unwrap_or(Value::Null))
             }
             Value::String(s) => {
                 let idx_f = self.to_number(&prop)?;
-                if idx_f.is_nan() || idx_f != idx_f.trunc() || idx_f < 0.0 {
-                    return Ok(Value::Null);
-                }
-                let idx = idx_f as usize;
-                match s.chars().nth(idx) {
-                    Some(ch) => Ok(Value::String(ch.to_string())),
-                    None => Ok(Value::Null),
+                if !idx_f.is_nan() && idx_f == idx_f.trunc() && idx_f >= 0.0 {
+                    let idx = idx_f as usize;
+                    return Ok(s
+                        .chars()
+                        .nth(idx)
+                        .map(|c| Value::String(c.to_string()))
+                        .unwrap_or(Value::Null));
                 }
             }
-            _ => Err(EvaluationError::TypeError(format!(
-                "Cannot index non-indexable value: {}",
-                self.value_to_string(&object)
-            ))),
+            Value::Object(_) => {}
+            _ => {
+                return Err(EvaluationError::TypeError(format!(
+                    "Cannot index non-indexable value: {}",
+                    self.value_to_string(&object)
+                )));
+            }
         }
+
+        let key = self.value_to_string(&prop);
+        let resolvable = self.resolve_member_on_value(object, &key)?;
+        resolvable.try_into_value()
     }
 
     fn check_arity(
@@ -1487,6 +1573,50 @@ impl Evaluator {
                         "'{}' (resulting from expression '{}') is not a function.",
                         self.value_to_string(&json_val),
                         dot_expr.syntax().text()
+                    ))),
+                }
+            }
+            SyntaxKind::BRACKET_EXPR => {
+                // Bracket-member calls: arr['join'](','), Math['floor'](x).
+                // Resolve the property name via string coercion, then reuse
+                // the same resolver the dot-call path uses.
+                let bracket = BracketExpr::cast(callee_syntax.clone()).unwrap();
+                let object_expr = bracket.object().ok_or_else(|| {
+                    EvaluationError::Node(NodeError {
+                        message: "Missing object in bracket call expression".to_string(),
+                        node: Some(callee_syntax.clone()),
+                    })
+                })?;
+                let prop_expr = bracket.prop().ok_or_else(|| {
+                    EvaluationError::Node(NodeError {
+                        message: "Missing property in bracket call expression".to_string(),
+                        node: Some(callee_syntax.clone()),
+                    })
+                })?;
+                let prop_value = self.evaluate_node(prop_expr.syntax())?;
+                let prop_name = self.value_to_string(&prop_value);
+
+                let resolvable = if object_expr.syntax().kind() == SyntaxKind::NAME_REF {
+                    let ns_name = object_expr.syntax().text().to_string();
+                    if let Some(result) = self.resolve_namespace_member(&ns_name, &prop_name) {
+                        result?
+                    } else {
+                        let obj = self.evaluate_node(object_expr.syntax())?;
+                        self.resolve_member_on_value(obj, &prop_name)?
+                    }
+                } else {
+                    let obj = self.evaluate_node(object_expr.syntax())?;
+                    self.resolve_member_on_value(obj, &prop_name)?
+                };
+
+                match resolvable {
+                    ResolvableValue::BuiltInMethod { object, method } => {
+                        self.invoke_builtin_method(*object, method, &evaluated_args)
+                    }
+                    ResolvableValue::Json(json_val) => Err(EvaluationError::TypeError(format!(
+                        "'{}' (resulting from expression '{}') is not a function.",
+                        self.value_to_string(&json_val),
+                        bracket.syntax().text()
                     ))),
                 }
             }

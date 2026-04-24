@@ -167,11 +167,11 @@ fn includes_case_sensitive() {
 
 #[test]
 fn includes_coerces_non_string_arg() {
-    // Numeric literals stringify with trailing ".0" (exprimo f64 quirk),
-    // so `1` searches for "1.0" — not found in "a1b".
+    // Numbers coerce via JS ToString: 1 → "1" (canonical form).
     assert_eq!(ev().evaluate("'abc'.includes(1)").unwrap(), Value::Bool(false));
-    // The coerced form does match when the haystack contains "1.0".
-    assert_eq!(ev().evaluate("'v=1.0 ok'.includes(1)").unwrap(), Value::Bool(true));
+    assert_eq!(ev().evaluate("'a1b'.includes(1)").unwrap(), Value::Bool(true));
+    // Fractional numbers keep their decimal form.
+    assert_eq!(ev().evaluate("'v=1.5 ok'.includes(1.5)").unwrap(), Value::Bool(true));
     // null coerces to "null"
     assert_eq!(ev().evaluate("'is null'.includes(null)").unwrap(), Value::Bool(true));
     // booleans coerce to "true"/"false"
@@ -336,7 +336,7 @@ fn index_of_multibyte_reports_char_index() {
 
 #[test]
 fn index_of_coerces_non_string() {
-    // Numeric literals stringify as "1.0" (f64 quirk), so we search for that form.
+    // Canonical ToString: 1 → "1", found at index 2 within "v=1.0 ok".
     assert_eq!(ev().evaluate("'v=1.0 ok'.indexOf(1)").unwrap(), num(2.0));
     assert_eq!(ev().evaluate("'null is null'.indexOf(null)").unwrap(), num(0.0));
     assert_eq!(ev().evaluate("'trueval'.indexOf(true)").unwrap(), num(0.0));

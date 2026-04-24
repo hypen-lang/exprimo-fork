@@ -368,7 +368,8 @@ fn join_null_renders_as_empty_string() {
         "a",
         Value::Array(vec![num(1.0), Value::Null, num(3.0)]),
     )]);
-    assert_eq!(ev2.evaluate("a.join(',')").unwrap(), s("1.0,,3.0"));
+    // Integer-valued f64s now render canonically (no trailing ".0").
+    assert_eq!(ev2.evaluate("a.join(',')").unwrap(), s("1,,3"));
 }
 
 #[test]
@@ -678,26 +679,33 @@ fn object_index_with_null_matches_null_key() {
 }
 
 #[test]
-fn object_index_with_numeric_literal_uses_f64_stringification_quirk() {
-    // Numeric literals stringify as "1.0" not "1" (exprimo f64 quirk),
-    // so `o[1]` does NOT match the JSON-standard key "1".
+fn object_index_with_numeric_literal_canonicalizes_key() {
+    // JS ToPropertyKey: the number 1 stringifies to "1", matching the
+    // JSON-standard key.
     let mut m = serde_json::Map::new();
     m.insert("1".into(), s("one"));
     m.insert("1.0".into(), s("one-point-zero"));
     let ev = ev_with(&[("o", Value::Object(m))]);
-    assert_eq!(ev.evaluate("o[1]").unwrap(), s("one-point-zero"));
-    // The canonical "1" key is only reachable via the string form.
-    assert_eq!(ev.evaluate("o['1']").unwrap(), s("one"));
+    assert_eq!(ev.evaluate("o[1]").unwrap(), s("one"));
+    // The "1.0" key is still only reachable via the explicit string form.
+    assert_eq!(ev.evaluate("o['1.0']").unwrap(), s("one-point-zero"));
 }
 
 #[test]
-fn object_index_with_numeric_expression_quirk() {
-    // 1 + 1 = 2 (f64), stringifies as "2.0"
+fn object_index_with_numeric_expression_canonicalizes_key() {
+    // 1 + 1 = 2 — canonical "2" key, not "2.0".
     let mut m = serde_json::Map::new();
     m.insert("2".into(), s("two"));
-    m.insert("2.0".into(), s("two-float"));
     let ev = ev_with(&[("o", Value::Object(m))]);
-    assert_eq!(ev.evaluate("o[1 + 1]").unwrap(), s("two-float"));
+    assert_eq!(ev.evaluate("o[1 + 1]").unwrap(), s("two"));
+}
+
+#[test]
+fn object_index_with_fractional_uses_decimal_form() {
+    let mut m = serde_json::Map::new();
+    m.insert("1.5".into(), s("found"));
+    let ev = ev_with(&[("o", Value::Object(m))]);
+    assert_eq!(ev.evaluate("o[1.5]").unwrap(), s("found"));
 }
 
 #[test]
@@ -732,12 +740,13 @@ fn string_index_with_infinity_returns_null() {
 //
 // JS: Array.prototype.toString is equivalent to .join(','), and join
 // stringifies each element via toString (recursive for arrays, static
-// "[object Object]" for objects). exprimo now matches this, modulo the
-// f64 stringification quirk (integer values render with ".0").
+// "[object Object]" for objects). exprimo now matches this exactly,
+// including canonical number stringification (integer-valued floats
+// render without trailing ".0").
 
 #[test]
 fn join_nested_arrays_recursively() {
-    // JS: [[1,2], [3,4]].join('-') === "1,2-3,4" (exprimo adds .0 for floats)
+    // JS: [[1,2], [3,4]].join('-') === "1,2-3,4"
     let ev = ev_with(&[(
         "a",
         Value::Array(vec![
@@ -745,7 +754,7 @@ fn join_nested_arrays_recursively() {
             Value::Array(vec![num(3.0), num(4.0)]),
         ]),
     )]);
-    assert_eq!(ev.evaluate("a.join('-')").unwrap(), s("1.0,2.0-3.0,4.0"));
+    assert_eq!(ev.evaluate("a.join('-')").unwrap(), s("1,2-3,4"));
 }
 
 #[test]
@@ -808,7 +817,7 @@ fn join_of_all_nulls() {
 
 #[test]
 fn concatenation_stringifies_arrays_recursively() {
-    // 'x' + [1,2] in JS becomes "x1,2". exprimo matches modulo f64 quirk.
+    // 'x' + [1,2] in JS becomes "x1,2" (canonical ToString).
     let ev = ev_with(&[(
         "a",
         Value::Array(vec![Value::Number(1.into()), Value::Number(2.into())]),

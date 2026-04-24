@@ -564,6 +564,9 @@ See [CHANGELOG.md](CHANGELOG.md) for version history.
 - ✅ Bracket indexing: `arr[0]`, `obj[key]`, `str[0]` with dynamic keys and type coercion (`arr[true]`, `arr['0']`, `obj[null]`)
 - ✅ Additional array methods: `.indexOf()`, `.join()`, `.slice()`
 - ✅ JS-compliant Array/Object coercion: `[1,[2,3]].join('-')` produces `"1-2,3"` (recursive), objects stringify to `"[object Object]"`
+- ✅ Bracket-member calls: `arr['join'](',')`, `Math['floor'](x)`, `obj['hasOwnProperty']('k')` all resolve like their dot-access equivalents
+- ✅ Canonical number stringification (ToString / ToPropertyKey): integer-valued numbers render without trailing `.0`; `obj[1]` now correctly looks up key `"1"`; concatenation `'x=' + 1` → `"x=1"`
+- ✅ Own-property shadowing: `({hasOwnProperty: 42}).hasOwnProperty` returns `42`, matching JS prototype-chain semantics
 - ✅ Division by zero returns `Infinity`/`NaN` instead of errors
 - ✅ Invalid type conversions return `NaN` instead of errors
 - ✅ Proper NaN comparison semantics (`NaN != NaN`)

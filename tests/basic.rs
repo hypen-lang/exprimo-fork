@@ -321,11 +321,13 @@ fn test_object_has_own_property_success() {
 
     let evaluator3_num = Evaluator::new(context3, HashMap::new());
 
+    // After the canonical-stringification fix, the number 123 coerces to "123"
+    // (JS ToString), which matches the stored key.
     assert_eq!(
         evaluator3_num
             .evaluate("objNumStrKey.hasOwnProperty(123)")
             .unwrap(),
-        Value::Bool(false)
+        Value::Bool(true)
     );
     assert_eq!(
         evaluator3_num
