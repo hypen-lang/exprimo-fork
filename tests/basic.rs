@@ -1324,6 +1324,240 @@ fn test_hypen_truncated_bio() {
     );
 }
 
+// --- Object namespace tests ---
+
+#[test]
+fn test_object_keys_values_entries() {
+    let mut ctx = HashMap::new();
+    let mut obj = serde_json::Map::new();
+    obj.insert("a".to_string(), Value::Number(1.into()));
+    obj.insert("b".to_string(), Value::Number(2.into()));
+    obj.insert("c".to_string(), Value::String("three".to_string()));
+    ctx.insert("obj".to_string(), Value::Object(obj));
+    let ev = Evaluator::new(ctx, HashMap::new());
+
+    let keys = ev.evaluate("Object.keys(obj)").unwrap();
+    assert_eq!(
+        keys,
+        Value::Array(vec![
+            Value::String("a".to_string()),
+            Value::String("b".to_string()),
+            Value::String("c".to_string()),
+        ])
+    );
+
+    let values = ev.evaluate("Object.values(obj)").unwrap();
+    assert_eq!(
+        values,
+        Value::Array(vec![
+            Value::Number(1.into()),
+            Value::Number(2.into()),
+            Value::String("three".to_string()),
+        ])
+    );
+
+    let entries = ev.evaluate("Object.entries(obj)").unwrap();
+    assert_eq!(
+        entries,
+        Value::Array(vec![
+            Value::Array(vec![
+                Value::String("a".to_string()),
+                Value::Number(1.into()),
+            ]),
+            Value::Array(vec![
+                Value::String("b".to_string()),
+                Value::Number(2.into()),
+            ]),
+            Value::Array(vec![
+                Value::String("c".to_string()),
+                Value::String("three".to_string()),
+            ]),
+        ])
+    );
+}
+
+#[test]
+fn test_object_keys_on_non_object() {
+    let ev = Evaluator::new(HashMap::new(), HashMap::new());
+    match ev.evaluate("Object.keys('hi')") {
+        Err(EvaluationError::TypeError(msg)) => {
+            assert!(msg.contains("non-object"));
+        }
+        other => panic!("Expected TypeError, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_object_unknown_method() {
+    let ev = Evaluator::new(HashMap::new(), HashMap::new());
+    match ev.evaluate("Object.foo({})") {
+        Err(EvaluationError::TypeError(msg)) => {
+            assert!(msg.contains("Object.foo"));
+        }
+        other => panic!("Expected TypeError, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_object_shadowed_by_context() {
+    // A user-defined `Object` binding should shadow the namespace.
+    let mut ctx = HashMap::new();
+    let mut m = serde_json::Map::new();
+    m.insert("custom".to_string(), Value::String("shadowed".to_string()));
+    ctx.insert("Object".to_string(), Value::Object(m));
+    let ev = Evaluator::new(ctx, HashMap::new());
+    assert_eq!(
+        ev.evaluate("Object.custom").unwrap(),
+        Value::String("shadowed".to_string())
+    );
+}
+
+// --- Complex array literal tests ---
+
+#[test]
+fn test_array_literal_with_elements() {
+    let ev = Evaluator::new(HashMap::new(), HashMap::new());
+    let result = ev.evaluate("[1, 2, 3]").unwrap();
+    assert_eq!(
+        result,
+        Value::Array(vec![
+            num(1.0),
+            num(2.0),
+            num(3.0),
+        ])
+    );
+    // mixed types
+    let result2 = ev.evaluate("[1, 'two', true, null]").unwrap();
+    assert_eq!(
+        result2,
+        Value::Array(vec![
+            num(1.0),
+            Value::String("two".to_string()),
+            Value::Bool(true),
+            Value::Null,
+        ])
+    );
+}
+
+#[test]
+fn test_array_literal_with_expressions() {
+    let mut ctx = HashMap::new();
+    ctx.insert("x".to_string(), num(10.0));
+    let ev = Evaluator::new(ctx, HashMap::new());
+    let result = ev.evaluate("[x, x + 1, x * 2]").unwrap();
+    assert_eq!(
+        result,
+        Value::Array(vec![
+            num(10.0),
+            num(11.0),
+            num(20.0),
+        ])
+    );
+}
+
+#[test]
+fn test_array_literal_nested() {
+    let ev = Evaluator::new(HashMap::new(), HashMap::new());
+    let result = ev.evaluate("[[1, 2], [3, 4]]").unwrap();
+    assert_eq!(
+        result,
+        Value::Array(vec![
+            Value::Array(vec![num(1.0), num(2.0)]),
+            Value::Array(vec![num(3.0), num(4.0)]),
+        ])
+    );
+}
+
+#[test]
+fn test_array_literal_with_methods() {
+    let ev = Evaluator::new(HashMap::new(), HashMap::new());
+    assert_eq!(ev.evaluate("[1, 2, 3].length").unwrap(), num(3.0));
+    assert_eq!(
+        ev.evaluate("[1, 2, 3].includes(2)").unwrap(),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        ev.evaluate("['a', 'b', 'c'].join('-')").unwrap(),
+        Value::String("a-b-c".to_string())
+    );
+    assert_eq!(
+        ev.evaluate("[10, 20, 30][1]").unwrap(),
+        num(20.0)
+    );
+}
+
+// --- Complex object literal tests ---
+// Note: `{a: 1}` at statement position is parsed as a block; wrap in parens.
+
+#[test]
+fn test_object_literal_simple() {
+    let ev = Evaluator::new(HashMap::new(), HashMap::new());
+    let result = ev.evaluate("({a: 1, b: 2})").unwrap();
+    let mut expected = serde_json::Map::new();
+    expected.insert("a".to_string(), num(1.0));
+    expected.insert("b".to_string(), num(2.0));
+    assert_eq!(result, Value::Object(expected));
+}
+
+#[test]
+fn test_object_literal_string_keys() {
+    let ev = Evaluator::new(HashMap::new(), HashMap::new());
+    let result = ev.evaluate("({'foo': 1, \"bar\": 2})").unwrap();
+    let mut expected = serde_json::Map::new();
+    expected.insert("foo".to_string(), num(1.0));
+    expected.insert("bar".to_string(), num(2.0));
+    assert_eq!(result, Value::Object(expected));
+}
+
+#[test]
+fn test_object_literal_with_expressions() {
+    let mut ctx = HashMap::new();
+    ctx.insert("x".to_string(), num(5.0));
+    let ev = Evaluator::new(ctx, HashMap::new());
+    let result = ev.evaluate("({value: x * 2, doubled: x + x})").unwrap();
+    let mut expected = serde_json::Map::new();
+    expected.insert("value".to_string(), num(10.0));
+    expected.insert("doubled".to_string(), num(10.0));
+    assert_eq!(result, Value::Object(expected));
+}
+
+#[test]
+fn test_object_literal_nested() {
+    let ev = Evaluator::new(HashMap::new(), HashMap::new());
+    let result = ev.evaluate("({outer: {inner: 42}})").unwrap();
+    let mut inner = serde_json::Map::new();
+    inner.insert("inner".to_string(), num(42.0));
+    let mut outer = serde_json::Map::new();
+    outer.insert("outer".to_string(), Value::Object(inner));
+    assert_eq!(result, Value::Object(outer));
+}
+
+#[test]
+fn test_object_literal_with_arrays() {
+    let ev = Evaluator::new(HashMap::new(), HashMap::new());
+    let result = ev.evaluate("({items: [1, 2, 3], tags: ['a', 'b']})").unwrap();
+    let mut expected = serde_json::Map::new();
+    expected.insert(
+        "items".to_string(),
+        Value::Array(vec![num(1.0), num(2.0), num(3.0)]),
+    );
+    expected.insert(
+        "tags".to_string(),
+        Value::Array(vec![
+            Value::String("a".to_string()),
+            Value::String("b".to_string()),
+        ]),
+    );
+    assert_eq!(result, Value::Object(expected));
+}
+
+#[test]
+fn test_object_literal_access() {
+    let ev = Evaluator::new(HashMap::new(), HashMap::new());
+    assert_eq!(ev.evaluate("({a: 1, b: 2}).a").unwrap(), num(1.0));
+    assert_eq!(ev.evaluate("({a: 1, b: 2})['b']").unwrap(), num(2.0));
+}
+
 #[test]
 fn test_hypen_tags_join() {
     let mut ctx = HashMap::new();

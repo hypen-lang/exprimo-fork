@@ -364,6 +364,16 @@ evaluator.evaluate("Math.max(1, 2, 3)").unwrap();   // 3
 
 If the context defines its own `Math` identifier, it shadows the namespace.
 
+### Object namespace
+
+`Object.keys`, `Object.values`, `Object.entries` behave like their JavaScript counterparts. Can be shadowed by a context-defined `Object`.
+
+```rust
+evaluator.evaluate("Object.keys(obj)").unwrap();    // ["a", "b", "c"]
+evaluator.evaluate("Object.values(obj)").unwrap();  // [1, 2, "three"]
+evaluator.evaluate("Object.entries(obj)").unwrap(); // [["a", 1], ["b", 2], ["c", "three"]]
+```
+
 ### Bracket Indexing
 
 Arrays, objects, and strings all support `obj[expr]` indexing. Missing indices (out of range, negative, or unknown keys) return `null`.
@@ -504,14 +514,12 @@ match result {
    - `NaN` and `Infinity` don't serialize perfectly to JSON
    - Workarounds are in place, but consider a custom `Value` type for production
 
-2. **Complex Literals**
-   - Only empty array `[]` and empty object `{}` literals are supported
-   - Complex literals like `[1, 2, 3]` or `{a: 1, b: 2}` are not yet implemented
-   - **Workaround:** Pass complex structures via context, or use bracket indexing on context-supplied arrays/objects
+2. **Object Literal Ambiguity**
+   - `{a: 1}` at statement position is parsed as a block (standard JavaScript quirk)
+   - **Workaround:** Wrap in parentheses: `({a: 1})`. Array literals `[1, 2, 3]` and nested literals work directly.
 
-3. **Object Literal Ambiguity**
-   - `{}` in expression context is parsed as a block statement (JavaScript quirk)
-   - **Workaround:** Use variables or wrap in parentheses (future support)
+3. **No spread, getters/setters, shorthand properties, methods in literals**
+   - `[...arr]`, `{foo}` shorthand, `{get x() {}}` are rejected at evaluation.
 
 ## Testing
 
@@ -551,6 +559,8 @@ See [CHANGELOG.md](CHANGELOG.md) for version history.
 - ✅ String methods: `.length`, `.toUpperCase()`, `.toLowerCase()`, `.trim()`, `.includes()`, `.startsWith()`, `.endsWith()`, `.slice()`, `.indexOf()`
 - ✅ `Number.toFixed(digits)` for currency / fixed-precision display
 - ✅ `Math` namespace: `floor`, `ceil`, `round`, `abs`, `min`, `max`
+- ✅ `Object` namespace: `keys`, `values`, `entries`
+- ✅ Complex array/object literals: `[1, 2, 3]`, `({a: 1, b: 2})` (with nested and expression values)
 - ✅ Bracket indexing: `arr[0]`, `obj[key]`, `str[0]` with dynamic keys
 - ✅ Additional array methods: `.indexOf()`, `.join()`, `.slice()`
 - ✅ Division by zero returns `Infinity`/`NaN` instead of errors

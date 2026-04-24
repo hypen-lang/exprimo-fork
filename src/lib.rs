@@ -1,7 +1,7 @@
 use rslint_parser::{
     ast::{
-        BinExpr, BinOp, BracketExpr, CallExpr, CondExpr, DotExpr, Expr, GroupingExpr, Name,
-        NameRef, UnaryExpr, UnaryOp,
+        ArrayExpr, BinExpr, BinOp, BracketExpr, CallExpr, CondExpr, DotExpr, Expr, GroupingExpr,
+        LiteralProp, Name, NameRef, ObjectExpr, ObjectProp, PropName, UnaryExpr, UnaryOp,
     },
     parse_text,
     AstNode,
@@ -64,6 +64,9 @@ pub enum BuiltInMethodKind {
     MathAbs,
     MathMin,
     MathMax,
+    ObjectKeys,
+    ObjectValues,
+    ObjectEntries,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -190,30 +193,11 @@ impl Evaluator {
                 })?;
                 self.evaluate_node(inner_expr.syntax())
             }
-            // Handle simple array and object literals
             SyntaxKind::ARRAY_EXPR => {
-                // For now, only support empty array literal []
-                // Complex array literals [1,2,3] would require iterating elements
-                if node.children().count() == 0 {
-                    Ok(Value::Array(vec![]))
-                } else {
-                    Err(EvaluationError::Node(NodeError {
-                        message: "Complex array literals are not yet supported.".to_string(),
-                        node: Some(node.clone()),
-                    }))
-                }
+                self.evaluate_array_expr(&ArrayExpr::cast(node.clone()).unwrap())
             }
             SyntaxKind::OBJECT_EXPR => {
-                // For now, only support empty object literal {}
-                // Complex object literals {a:1} would require parsing properties
-                if node.children().count() == 0 {
-                    Ok(Value::Object(serde_json::Map::new()))
-                } else {
-                    Err(EvaluationError::Node(NodeError {
-                        message: "Complex object literals are not yet supported.".to_string(),
-                        node: Some(node.clone()),
-                    }))
-                }
+                self.evaluate_object_expr(&ObjectExpr::cast(node.clone()).unwrap())
             }
             _ => Err(EvaluationError::Node(NodeError {
                 message: format!("Unsupported syntax kind: {:?}", node.kind()),
@@ -443,8 +427,8 @@ impl Evaluator {
         // So we need to get its text representation.
         let prop_name = prop_name_ident.syntax().text().to_string();
 
-        // Namespace shortcut: Math.foo — resolve without requiring Math in context,
-        // but allow a context-defined `Math` to shadow it.
+        // Namespace shortcut: Math.foo / Object.keys — resolve without requiring
+        // the identifier in context, but allow a context-defined binding to shadow.
         if object_expr.syntax().kind() == SyntaxKind::NAME_REF {
             let ns_name = object_expr.syntax().text().to_string();
             if ns_name == "Math" && !self.context.contains_key("Math") {
@@ -458,6 +442,23 @@ impl Evaluator {
                     _ => {
                         return Err(EvaluationError::TypeError(format!(
                             "Math.{} is not supported",
+                            prop_name
+                        )));
+                    }
+                };
+                return Ok(ResolvableValue::BuiltInMethod {
+                    object: Box::new(Value::Null),
+                    method,
+                });
+            }
+            if ns_name == "Object" && !self.context.contains_key("Object") {
+                let method = match prop_name.as_str() {
+                    "keys" => BuiltInMethodKind::ObjectKeys,
+                    "values" => BuiltInMethodKind::ObjectValues,
+                    "entries" => BuiltInMethodKind::ObjectEntries,
+                    _ => {
+                        return Err(EvaluationError::TypeError(format!(
+                            "Object.{} is not supported",
                             prop_name
                         )));
                     }
@@ -891,6 +892,88 @@ impl Evaluator {
         result
     }
 
+    fn evaluate_array_expr(&self, array_expr: &ArrayExpr) -> Result<Value, EvaluationError> {
+        use rslint_parser::ast::ExprOrSpread;
+        let mut out = Vec::new();
+        for element in array_expr.elements() {
+            match element {
+                ExprOrSpread::Expr(expr) => {
+                    let v = self.evaluate_node(expr.syntax())?;
+                    out.push(v);
+                }
+                ExprOrSpread::Spread(_) => {
+                    return Err(EvaluationError::Node(NodeError {
+                        message: "Spread elements are not supported in array literals".to_string(),
+                        node: Some(array_expr.syntax().clone()),
+                    }));
+                }
+            }
+        }
+        Ok(Value::Array(out))
+    }
+
+    fn evaluate_object_expr(&self, object_expr: &ObjectExpr) -> Result<Value, EvaluationError> {
+        let mut map = serde_json::Map::new();
+        for prop in object_expr.props() {
+            match prop {
+                ObjectProp::LiteralProp(lit) => {
+                    let (key, value) = self.evaluate_literal_prop(&lit)?;
+                    map.insert(key, value);
+                }
+                _ => {
+                    return Err(EvaluationError::Node(NodeError {
+                        message: "Only plain key:value object properties are supported".to_string(),
+                        node: Some(object_expr.syntax().clone()),
+                    }));
+                }
+            }
+        }
+        Ok(Value::Object(map))
+    }
+
+    fn evaluate_literal_prop(
+        &self,
+        lit: &LiteralProp,
+    ) -> Result<(String, Value), EvaluationError> {
+        let key_node = lit.key().ok_or_else(|| {
+            EvaluationError::Node(NodeError {
+                message: "Missing key in object property".to_string(),
+                node: Some(lit.syntax().clone()),
+            })
+        })?;
+        let key = self.prop_name_to_string(&key_node)?;
+        let value_expr = lit.value().ok_or_else(|| {
+            EvaluationError::Node(NodeError {
+                message: "Missing value in object property".to_string(),
+                node: Some(lit.syntax().clone()),
+            })
+        })?;
+        let value = self.evaluate_node(value_expr.syntax())?;
+        Ok((key, value))
+    }
+
+    fn prop_name_to_string(&self, prop_name: &PropName) -> Result<String, EvaluationError> {
+        match prop_name {
+            PropName::Ident(name) => Ok(name.syntax().text().to_string()),
+            PropName::Literal(literal) => {
+                // For "foo"/'foo'/42, evaluate the literal then stringify.
+                let v = self.evaluate_node(literal.syntax())?;
+                Ok(self.value_to_string(&v))
+            }
+            PropName::Computed(computed) => {
+                // [expr] — evaluate the inner expression and stringify.
+                let inner = computed.syntax().first_child().ok_or_else(|| {
+                    EvaluationError::Node(NodeError {
+                        message: "Empty computed property key".to_string(),
+                        node: Some(computed.syntax().clone()),
+                    })
+                })?;
+                let v = self.evaluate_node(&inner)?;
+                Ok(self.value_to_string(&v))
+            }
+        }
+    }
+
     fn evaluate_bracket_expr(
         &self,
         bracket_expr: &BracketExpr,
@@ -1295,6 +1378,41 @@ impl Evaluator {
                     }
                 }
                 Ok(self.f64_to_value(best))
+            }
+            BuiltInMethodKind::ObjectKeys => {
+                self.check_arity(1, args.len())?;
+                match &args[0] {
+                    Value::Object(map) => Ok(Value::Array(
+                        map.keys().cloned().map(Value::String).collect(),
+                    )),
+                    _ => Err(EvaluationError::TypeError(
+                        "Object.keys called on a non-object value".to_string(),
+                    )),
+                }
+            }
+            BuiltInMethodKind::ObjectValues => {
+                self.check_arity(1, args.len())?;
+                match &args[0] {
+                    Value::Object(map) => Ok(Value::Array(map.values().cloned().collect())),
+                    _ => Err(EvaluationError::TypeError(
+                        "Object.values called on a non-object value".to_string(),
+                    )),
+                }
+            }
+            BuiltInMethodKind::ObjectEntries => {
+                self.check_arity(1, args.len())?;
+                match &args[0] {
+                    Value::Object(map) => Ok(Value::Array(
+                        map.iter()
+                            .map(|(k, v)| {
+                                Value::Array(vec![Value::String(k.clone()), v.clone()])
+                            })
+                            .collect(),
+                    )),
+                    _ => Err(EvaluationError::TypeError(
+                        "Object.entries called on a non-object value".to_string(),
+                    )),
+                }
             }
         }
     }
